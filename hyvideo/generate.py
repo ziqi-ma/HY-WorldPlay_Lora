@@ -135,9 +135,75 @@ def parse_pose_string(pose_string):
             # Yaw right
             for _ in range(num_frames):
                 motions.append({"yaw": yaw_speed})
+        # Combined rotation actions
+        elif action == "rightup":
+            for _ in range(num_frames):
+                motions.append({"yaw": yaw_speed, "pitch": pitch_speed})
+        elif action == "rightdown":
+            for _ in range(num_frames):
+                motions.append({"yaw": yaw_speed, "pitch": -pitch_speed})
+        elif action == "leftup":
+            for _ in range(num_frames):
+                motions.append({"yaw": -yaw_speed, "pitch": pitch_speed})
+        elif action == "leftdown":
+            for _ in range(num_frames):
+                motions.append({"yaw": -yaw_speed, "pitch": -pitch_speed})
+        # Combined translation actions (WASD diagonals)
+        elif action in ("wd", "dw"):
+            for _ in range(num_frames):
+                motions.append({"forward": forward_speed, "right": forward_speed})
+        elif action in ("wa", "aw"):
+            for _ in range(num_frames):
+                motions.append({"forward": forward_speed, "right": -forward_speed})
+        elif action in ("sd", "ds"):
+            for _ in range(num_frames):
+                motions.append({"forward": -forward_speed, "right": forward_speed})
+        elif action in ("sa", "as"):
+            for _ in range(num_frames):
+                motions.append({"forward": -forward_speed, "right": -forward_speed})
+        # Combined translation + rotation actions
+        elif action == "wright":
+            for _ in range(num_frames):
+                motions.append({"forward": forward_speed, "yaw": yaw_speed})
+        elif action == "wleft":
+            for _ in range(num_frames):
+                motions.append({"forward": forward_speed, "yaw": -yaw_speed})
+        elif action == "sright":
+            for _ in range(num_frames):
+                motions.append({"forward": -forward_speed, "yaw": yaw_speed})
+        elif action == "sleft":
+            for _ in range(num_frames):
+                motions.append({"forward": -forward_speed, "yaw": -yaw_speed})
+        elif action == "dright":
+            for _ in range(num_frames):
+                motions.append({"right": forward_speed, "yaw": yaw_speed})
+        elif action == "dleft":
+            for _ in range(num_frames):
+                motions.append({"right": forward_speed, "yaw": -yaw_speed})
+        elif action == "aright":
+            for _ in range(num_frames):
+                motions.append({"right": -forward_speed, "yaw": yaw_speed})
+        elif action == "aleft":
+            for _ in range(num_frames):
+                motions.append({"right": -forward_speed, "yaw": -yaw_speed})
+        elif action == "wup":
+            for _ in range(num_frames):
+                motions.append({"forward": forward_speed, "pitch": pitch_speed})
+        elif action == "wdown":
+            for _ in range(num_frames):
+                motions.append({"forward": forward_speed, "pitch": -pitch_speed})
+        elif action == "sup":
+            for _ in range(num_frames):
+                motions.append({"forward": -forward_speed, "pitch": pitch_speed})
+        elif action == "sdown":
+            for _ in range(num_frames):
+                motions.append({"forward": -forward_speed, "pitch": -pitch_speed})
         else:
             raise ValueError(
-                f"Unknown action: {action}. Supported actions: w, s, a, d, up, down, left, right"
+                f"Unknown action: {action}. Supported: w, s, a, d, up, down, left, right, "
+                f"rightup, rightdown, leftup, leftdown, wd, wa, sd, sa (and reverses), "
+                f"wright, wleft, sright, sleft, dright, dleft, aright, aleft, "
+                f"wup, wdown, sup, sdown"
             )
 
     return motions
@@ -388,6 +454,49 @@ def parse_pose_string_to_actions(pose_string, fps=24):
             action_values["yaw"] = -1
         elif action == "right":
             action_values["yaw"] = 1
+        # Combined rotations
+        elif action == "rightup":
+            action_values["yaw"] = 1; action_values["pitch"] = 1
+        elif action == "rightdown":
+            action_values["yaw"] = 1; action_values["pitch"] = -1
+        elif action == "leftup":
+            action_values["yaw"] = -1; action_values["pitch"] = 1
+        elif action == "leftdown":
+            action_values["yaw"] = -1; action_values["pitch"] = -1
+        # Combined translations (WASD diagonals)
+        elif action in ("wd", "dw"):
+            action_values["forward"] = 1; action_values["left"] = -1
+        elif action in ("wa", "aw"):
+            action_values["forward"] = 1; action_values["left"] = 1
+        elif action in ("sd", "ds"):
+            action_values["forward"] = -1; action_values["left"] = -1
+        elif action in ("sa", "as"):
+            action_values["forward"] = -1; action_values["left"] = 1
+        # Combined translation + rotation
+        elif action == "wright":
+            action_values["forward"] = 1; action_values["yaw"] = 1
+        elif action == "wleft":
+            action_values["forward"] = 1; action_values["yaw"] = -1
+        elif action == "sright":
+            action_values["forward"] = -1; action_values["yaw"] = 1
+        elif action == "sleft":
+            action_values["forward"] = -1; action_values["yaw"] = -1
+        elif action == "dright":
+            action_values["left"] = -1; action_values["yaw"] = 1
+        elif action == "dleft":
+            action_values["left"] = -1; action_values["yaw"] = -1
+        elif action == "aright":
+            action_values["left"] = 1; action_values["yaw"] = 1
+        elif action == "aleft":
+            action_values["left"] = 1; action_values["yaw"] = -1
+        elif action == "wup":
+            action_values["forward"] = 1; action_values["pitch"] = 1
+        elif action == "wdown":
+            action_values["forward"] = 1; action_values["pitch"] = -1
+        elif action == "sup":
+            action_values["forward"] = -1; action_values["pitch"] = 1
+        elif action == "sdown":
+            action_values["forward"] = -1; action_values["pitch"] = -1
         else:
             raise ValueError(f"Unknown action: {action}")
 

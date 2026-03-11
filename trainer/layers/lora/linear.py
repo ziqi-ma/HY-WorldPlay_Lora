@@ -20,7 +20,10 @@ from trainer.layers.linear import (ColumnParallelLinear, LinearBase,
 from trainer.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from trainer.utils import get_mixed_precision_state
 
-torch._dynamo.config.recompile_limit = 16
+try:
+    torch._dynamo.config.recompile_limit = 16
+except AttributeError:
+    pass
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -63,7 +66,7 @@ class BaseLayerWithLoRA(nn.Module):
                             device=self.base_layer.weight.device,
                             dtype=self.base_layer.weight.dtype))
             torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-            torch.nn.init.kaiming_uniform_(self.lora_B, a=math.sqrt(5))
+            torch.nn.init.zeros_(self.lora_B)
         else:
             self.lora_A = None
             self.lora_B = None
@@ -346,6 +349,30 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+class NNLinearWithLoRA(BaseLayerWithLoRA):
+    """LoRA wrapper for plain nn.Linear layers."""
+
+    def __init__(self, base_layer: nn.Linear, **kwargs):
+        super().__init__(base_layer, **kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lora_A = self.lora_A
+        lora_B = self.lora_B
+        if isinstance(self.lora_B, DTensor):
+            lora_B = self.lora_B.to_local()
+            lora_A = self.lora_A.to_local()
+
+        out = self.base_layer(x)
+        if (self.training_mode or not self.merged) and not self.disable_lora:
+            delta = x @ (
+                self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
+                @ self.slice_lora_a_weights(lora_A.to(x, non_blocking=True)))
+            if self.lora_alpha != self.lora_rank:
+                delta = delta * (self.lora_alpha / self.lora_rank)
+            out = out + delta
+        return out
+
+
 def get_lora_layer(layer: nn.Module,
                    lora_rank: int | None = None,
                    lora_alpha: int | None = None,
@@ -366,6 +393,12 @@ def get_lora_layer(layer: nn.Module,
                                   lora_alpha=lora_alpha,
                                   training_mode=training_mode)
             return ret
+    # Support plain nn.Linear
+    if isinstance(layer, nn.Linear):
+        return NNLinearWithLoRA(layer,
+                                lora_rank=lora_rank,
+                                lora_alpha=lora_alpha,
+                                training_mode=training_mode)
     return None
 
 

@@ -99,7 +99,7 @@ class ComposedPipelineBase(ABC):
             self.training_args = self.trainer_args
             assert self.training_args is not None
             self.initialize_training_pipeline(self.training_args)
-            if self.training_args.log_validation:
+            if self.training_args.log_validation or getattr(self.training_args, 'eval_steps', 0) > 0:
                 self.initialize_validation_pipeline(self.training_args)
 
         self.initialize_pipeline(self.trainer_args)

@@ -343,8 +343,10 @@ class DP_SP_BatchSampler(Sampler[list[int]]):
                         self.dataset_size % (self.num_sp_groups * self.batch_size))
                 logger.info("Padding the dataset from %d to %d",
                             self.dataset_size, self.dataset_size + padding_size)
-                global_indices = torch.cat(
-                    [global_indices, global_indices[:padding_size]])
+                # Repeat indices enough times to cover padding_size
+                repeats = (padding_size // len(global_indices)) + 1
+                padding = global_indices.repeat(repeats)[:padding_size]
+                global_indices = torch.cat([global_indices, padding])
 
         # shard the indices to each sp group
         ith_sp_group = self.global_rank // self.sp_world_size
@@ -402,17 +404,19 @@ class CameraJsonWMemDataset(Dataset):
 
         self.points_local = generate_points_in_sphere(50000, 8.0).to(device)
 
-        self.neg_prompt_pt = torch.load(
-            "/your_path/to/hunyuan_neg_prompt.pt",
-            map_location="cpu",
-            weights_only=True,
-        )
-
-        self.neg_byt5_pt = torch.load(
-            "/your_path/to/hunyuan_neg_byt5_prompt.pt",
-            map_location="cpu",
-            weights_only=True,
-        )
+        if self.cfg_rate > 0:
+            # Try to load negative prompt files from the first data entry, then fall back to defaults
+            neg_prompt_path = self.json_data[0].get(
+                "neg_prompt_path", "/your_path/to/hunyuan_neg_prompt.pt")
+            neg_byt5_path = self.json_data[0].get(
+                "neg_byt5_path", "/your_path/to/hunyuan_neg_byt5_prompt.pt")
+            self.neg_prompt_pt = torch.load(
+                neg_prompt_path, map_location="cpu", weights_only=True)
+            self.neg_byt5_pt = torch.load(
+                neg_byt5_path, map_location="cpu", weights_only=True)
+        else:
+            self.neg_prompt_pt = None
+            self.neg_byt5_pt = None
 
     def __len__(self):
         return self.all_length
@@ -454,6 +458,14 @@ class CameraJsonWMemDataset(Dataset):
         else:
             self.shared_state["max_frames"] = 160
 
+    def _load_latent_pt(self, path):
+        if not hasattr(self, '_latent_cache'):
+            self._latent_cache = {}
+        if path not in self._latent_cache:
+            self._latent_cache[path] = torch.load(
+                path, map_location="cpu", weights_only=False)
+        return self._latent_cache[path]
+
     def __getitem__(self, idx):
         while True:
             try:
@@ -461,11 +473,7 @@ class CameraJsonWMemDataset(Dataset):
                 latent_pt_path = json_data['latent_path']
                 pose_path = json_data['pose_path']
 
-                latent_pt = torch.load(
-                    os.path.join(latent_pt_path),
-                    map_location="cpu",
-                    weights_only=True,
-                )
+                latent_pt = self._load_latent_pt(latent_pt_path)
                 latent = latent_pt['latent'][0]
                 latent_length = latent.shape[1]
 
@@ -487,7 +495,7 @@ class CameraJsonWMemDataset(Dataset):
                 byt5_text_states = latent_pt['byt5_text_states'][0]
                 byt5_text_mask = latent_pt['byt5_text_mask'][0]
 
-                if self.rng.random() < self.cfg_rate:
+                if self.cfg_rate > 0 and self.neg_prompt_pt is not None and self.rng.random() < self.cfg_rate:
                     prompt_embed = self.neg_prompt_pt['negative_prompt_embeds'][0]
                     prompt_mask = self.neg_prompt_pt['negative_prompt_mask'][0]
                     byt5_text_states = self.neg_byt5_pt['byt5_text_states'][0]
@@ -600,7 +608,7 @@ class CameraJsonWMemDataset(Dataset):
                 select_window_out_flag = 0  # whether to select the latents with length > window_frames
                 select_prob = self.rng.random()
 
-                if select_prob < 0.8:
+                if select_prob < 0.8 and self.window_frames > self.memory_frames and latent.shape[1] > self.window_frames:
                     select_window_out_flag = 1  # mean to select frames outside the window
                     max_index = latent.shape[1] - (self.window_frames - self.memory_frames)
 

@@ -41,7 +41,11 @@ def gather_state_dict_on_cpu_rank0(
         for k, v in dict(model.named_parameters()).items() if v.requires_grad
     ])
     for param_name, param in sharded_sd.items():
-        if param_name not in param_requires_grad:
+        # state_dict() keys may contain ._checkpoint_wrapped_module. from
+        # activation-checkpointing wrappers; strip them so they match the
+        # cleaned named_parameters() keys stored in param_requires_grad.
+        clean_name = param_name.replace("._checkpoint_wrapped_module.", ".")
+        if clean_name not in param_requires_grad:
             continue
         if hasattr(param, "_local_tensor"):
             # DTensor case
@@ -61,7 +65,7 @@ def gather_state_dict_on_cpu_rank0(
                     param = param.to(device)
 
         if rank == 0:
-            cpu_state_dict[param_name] = param.cpu()
+            cpu_state_dict[clean_name] = param.cpu()
 
     return cpu_state_dict
 

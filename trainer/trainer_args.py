@@ -626,6 +626,12 @@ class TrainingArgs(TrainerArgs):
     validation_guidance_scale: str = ""
     validation_steps: float = 0.0
     log_validation: bool = False
+    eval_steps: int = 0  # run AR eval (LPIPS/L2) every N steps; 0 = disabled
+    eval_num_inference_steps: int = 50
+    gt_frames_dir: str = ""  # directory with GT PNG frames for eval
+    eval_pose_string: str = ""  # pose string for AR eval (e.g., "right-11")
+    eval_prompt: str = ""  # text prompt for AR eval (default: empty)
+    eval_image_path: str = ""  # reference image for AR eval (i2v input)
     tracker_project_name: str = ""
     wandb_run_name: str = ""
     seed: int | None = None
@@ -845,6 +851,30 @@ class TrainingArgs(TrainerArgs):
         parser.add_argument("--log-validation",
                             action=StoreBoolean,
                             help="Whether to log validation results")
+        parser.add_argument("--eval-steps",
+                            type=int,
+                            default=0,
+                            help="Run AR eval every N steps (0=disabled)")
+        parser.add_argument("--eval-num-inference-steps",
+                            type=int,
+                            default=50,
+                            help="Number of denoising steps for eval")
+        parser.add_argument("--gt-frames-dir",
+                            type=str,
+                            default="",
+                            help="Directory with GT PNG frames for eval")
+        parser.add_argument("--eval-pose-string",
+                            type=str,
+                            default="",
+                            help="Pose string for AR eval (e.g. 'right-11')")
+        parser.add_argument("--eval-prompt",
+                            type=str,
+                            default="",
+                            help="Text prompt for AR eval")
+        parser.add_argument("--eval-image-path",
+                            type=str,
+                            default="",
+                            help="Reference image for AR eval (i2v input)")
         parser.add_argument("--tracker-project-name",
                             type=str,
                             help="Project name for tracking")
@@ -1018,6 +1048,9 @@ class TrainingArgs(TrainerArgs):
                             help="Whether to use LoRA training")
         parser.add_argument("--lora-rank", type=int, help="LoRA rank")
         parser.add_argument("--lora-alpha", type=int, help="LoRA alpha")
+        parser.add_argument("--lora-target-modules", type=str, nargs='+',
+                            default=None,
+                            help="Target module names for LoRA (space-separated)")
 
         # Distillation arguments
         parser.add_argument("--generator-update-interval",

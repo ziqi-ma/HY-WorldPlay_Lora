@@ -168,7 +168,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
             window_frames=training_args.window_frames,
             batch_size=training_args.train_batch_size,
             num_data_workers=training_args.dataloader_num_workers,
-            drop_last=True,
+            drop_last=False,
             drop_first_row=False,
             seed=self.seed,
             cfg_rate=training_args.training_cfg_rate,
@@ -655,6 +655,11 @@ class TrainingPipeline(LoRAPipeline, ABC):
                                 self.lr_scheduler, self.noise_random_generator)
                 self.transformer.train()
                 self.sp_group.barrier()
+
+            if (self.training_args.eval_steps > 0
+                    and step % self.training_args.eval_steps == 0
+                    and hasattr(self, '_log_ar_validation')):
+                self._log_ar_validation(step)
 
         wandb.finish()
         save_checkpoint(self.transformer, self.global_rank,
