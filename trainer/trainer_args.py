@@ -684,7 +684,27 @@ class TrainingArgs(TrainerArgs):
     lora_alpha: int | None = None
     lora_training: bool = False
 
+    # Temporal embedding training parameters
+    temporal_embed_training: bool = False
+    temporal_embed_max_frames: int = 65
+    temporal_token_training: bool = False
+    temporal_embed_per_block_training: bool = False
+
+    # Validation loss paths (one seen + one unseen trajectory of the same scene)
+    val_seen_json_path: str = ""
+    val_unseen_json_path: str = ""
+
+    # Video generation eval (temporal embed training)
+    eval_pose_json: str = ""        # seen trajectory
+    eval_image_path: str = ""       # seen trajectory GT video / first frame
+    eval_pose_json_unseen: str = "" # unseen trajectory
+    eval_image_path_unseen: str = ""# unseen trajectory GT video / first frame
+    eval_action_ckpt: str = ""
+    eval_gpus: str = "4,5,6,7"
+
     # camera dataset
+    neg_prompt_path: str = ""
+    neg_byt5_path: str = ""
     json_path: str = ""
     causal: bool = False
     window_frames: int = 9
@@ -761,7 +781,8 @@ class TrainingArgs(TrainerArgs):
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         parser.add_argument("--data-path",
                             type=str,
-                            required=True,
+                            required=False,
+                            default="",
                             help="Path to parquet files")
         parser.add_argument("--dataloader-num-workers",
                             type=int,
@@ -787,7 +808,8 @@ class TrainingArgs(TrainerArgs):
                             help="Training batch size")
         parser.add_argument("--num-latent-t",
                             type=int,
-                            required=True,
+                            required=False,
+                            default=0,
                             help="Number of latent time steps")
         parser.add_argument("--group-frame",
                             action=StoreBoolean,
@@ -1088,6 +1110,68 @@ class TrainingArgs(TrainerArgs):
                             type=float,
                             default=1.0,
                             help="training time shift")
+
+        # Neg prompt embeddings (scene-specific)
+        parser.add_argument("--neg-prompt-path",
+                            type=str,
+                            default="",
+                            help="Path to hunyuan_neg_prompt.pt")
+        parser.add_argument("--neg-byt5-path",
+                            type=str,
+                            default="",
+                            help="Path to hunyuan_neg_byt5_prompt.pt")
+
+        # Temporal embedding training
+        parser.add_argument("--temporal-embed-training",
+                            action=StoreBoolean,
+                            help="Train only the temporal frame embedding")
+        parser.add_argument("--temporal-embed-max-frames",
+                            type=int,
+                            default=65,
+                            help="Max frames for temporal_frame_embed table")
+        parser.add_argument("--temporal-token-training",
+                            action=StoreBoolean,
+                            help="Train temporal tokens injected into txt stream")
+        parser.add_argument("--temporal-embed-per-block-training",
+                            action=StoreBoolean,
+                            help="Train one temporal frame embedding per double-stream block")
+
+        # Validation loss paths
+        parser.add_argument("--val-seen-json-path",
+                            type=str,
+                            default="",
+                            help="JSON for seen-trajectory validation loss")
+        parser.add_argument("--val-unseen-json-path",
+                            type=str,
+                            default="",
+                            help="JSON for unseen-trajectory validation loss")
+
+        # Video generation eval
+        parser.add_argument("--eval-pose-json",
+                            type=str,
+                            default="",
+                            help="pose.json for video generation eval")
+        parser.add_argument("--eval-image-path",
+                            type=str,
+                            default="",
+                            help="GT video/image path for video generation eval (first frame used)")
+        parser.add_argument("--eval-pose-json-unseen",
+                            type=str,
+                            default="",
+                            help="pose.json for unseen-trajectory video generation eval")
+        parser.add_argument("--eval-image-path-unseen",
+                            type=str,
+                            default="",
+                            help="GT video/image path for unseen-trajectory eval (first frame used)")
+        parser.add_argument("--eval-action-ckpt",
+                            type=str,
+                            default="",
+                            help="Path to AR action safetensors for eval subprocess")
+        parser.add_argument("--eval-gpus",
+                            type=str,
+                            default="4,5,6,7",
+                            help="CUDA_VISIBLE_DEVICES for eval subprocess")
+
         return parser
 
 

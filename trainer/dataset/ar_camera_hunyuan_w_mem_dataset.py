@@ -365,7 +365,7 @@ class DP_SP_BatchSampler(Sampler[list[int]]):
 
 class CameraJsonWMemDataset(Dataset):
     def __init__(self, json_path, causal, window_frames, batch_size, cfg_rate, i2v_rate, drop_last, drop_first_row,
-                 seed, device, shared_state):
+                 seed, device, shared_state, neg_prompt_path, neg_byt5_path):
         self.json_data = json.load(open(json_path, 'r'))
         self.all_length = len(self.json_data)
         self.causal = causal
@@ -403,13 +403,13 @@ class CameraJsonWMemDataset(Dataset):
         self.points_local = generate_points_in_sphere(50000, 8.0).to(device)
 
         self.neg_prompt_pt = torch.load(
-            "/your_path/to/hunyuan_neg_prompt.pt",
+            neg_prompt_path,
             map_location="cpu",
             weights_only=True,
         )
 
         self.neg_byt5_pt = torch.load(
-            "/your_path/to/hunyuan_neg_byt5_prompt.pt",
+            neg_byt5_path,
             map_location="cpu",
             weights_only=True,
         )
@@ -495,10 +495,22 @@ class CameraJsonWMemDataset(Dataset):
 
                 pose_json = json.load(open(pose_path, 'r'))
                 pose_keys = list(pose_json.keys())
+
+                # Detect format: per-latent-frame JSON has len(pose_keys) ~ latent_length;
+                # per-video-frame JSON has len(pose_keys) ~ 4 * latent_length.
+                per_latent_frame_pose = len(pose_keys) < 4 * (latent.shape[1] - 1) + 1
+                if per_latent_frame_pose:
+                    # Trim latent to available pose entries
+                    max_length = min(max_length, len(pose_keys))
+                    latent = latent[:, :max_length, ...]
+
                 intrinsic_list = []
                 w2c_list = []
                 for i in range(latent.shape[1]):
-                    t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
+                    if per_latent_frame_pose:
+                        t_key = pose_keys[i]
+                    else:
+                        t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
                     intrinsic = np.array(pose_json[t_key]['intrinsic'])
                     w2c = np.array(pose_json[t_key]['w2c'])
 
@@ -600,12 +612,14 @@ class CameraJsonWMemDataset(Dataset):
                 select_window_out_flag = 0  # whether to select the latents with length > window_frames
                 select_prob = self.rng.random()
 
-                if select_prob < 0.8:
-                    select_window_out_flag = 1  # mean to select frames outside the window
-                    max_index = latent.shape[1] - (self.window_frames - self.memory_frames)
+                # Can only do outside-window selection when there are more frames than the window
+                max_index = latent.shape[1] - (self.window_frames - self.memory_frames)
+                start_chunk_id = self.window_frames // 4
+                end_chunk_id = max_index // 4
+                can_select_outside = end_chunk_id >= start_chunk_id
 
-                    start_chunk_id = (self.window_frames) // 4
-                    end_chunk_id = max_index // 4
+                if select_prob < 0.8 and can_select_outside:
+                    select_window_out_flag = 1  # mean to select frames outside the window
                     current_frame_idx = self.rng.randint(start_chunk_id, end_chunk_id) * 4  # include the left and right
 
                     # -------------------- for ar, only search the memory for the current chunk
@@ -718,14 +732,17 @@ def build_ar_camera_hunyuan_w_mem_dataloader(
         drop_first_row,
         seed,
         cfg_rate,
-        i2v_rate, ) -> tuple[CameraJsonWMemDataset, StatefulDataLoader]:
+        i2v_rate,
+        neg_prompt_path,
+        neg_byt5_path, ) -> tuple[CameraJsonWMemDataset, StatefulDataLoader]:
     manager = mp.Manager()
     shared_state = manager.dict()
     shared_state["max_frames"] = window_frames
 
     dataset = CameraJsonWMemDataset(json_path, causal, window_frames, batch_size, cfg_rate, i2v_rate,
-                                    drop_last=drop_last, drop_first_row=drop_first_row, seed=seed, 
-                                    device=get_local_torch_device(), shared_state=shared_state)
+                                    drop_last=drop_last, drop_first_row=drop_first_row, seed=seed,
+                                    device=get_local_torch_device(), shared_state=shared_state,
+                                    neg_prompt_path=neg_prompt_path, neg_byt5_path=neg_byt5_path)
 
     loader = StatefulDataLoader(
         dataset,

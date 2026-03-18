@@ -81,6 +81,23 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def set_trainable(self) -> None:
 
+        is_temporal_embed_training = self.training_mode and (
+            getattr(self.trainer_args, "temporal_embed_training", False) or
+            getattr(self.trainer_args, "temporal_token_training", False) or
+            getattr(self.trainer_args, "temporal_embed_per_block_training", False)
+        )
+        if is_temporal_embed_training:
+            self.modules["transformer"].requires_grad_(False)
+            transformer = self.modules["transformer"]
+            if hasattr(transformer, "temporal_frame_embed"):
+                transformer.temporal_frame_embed.weight.requires_grad_(True)
+            if hasattr(transformer, "temporal_token_embed"):
+                transformer.temporal_token_embed.weight.requires_grad_(True)
+            if hasattr(transformer, "temporal_frame_embed_blocks"):
+                for emb in transformer.temporal_frame_embed_blocks:
+                    emb.weight.requires_grad_(True)
+            return
+
         is_lora_training = self.training_mode and getattr(
             self.trainer_args, "lora_training", False)
         if not is_lora_training:

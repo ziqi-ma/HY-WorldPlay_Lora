@@ -122,6 +122,18 @@ def remove_previous_state(output_dir, rank):
         if os.path.exists(dcp_dir) and rank == 0:
             shutil.rmtree(dcp_dir)
 
+def _has_fsdp_trainable_params(model) -> bool:
+    """Return True if any trainable param is an FSDP-sharded DTensor."""
+    try:
+        from torch.distributed._tensor import DTensor
+    except ImportError:
+        return False
+    for _, p in model.named_parameters():
+        if p.requires_grad and isinstance(p, DTensor):
+            return True
+    return False
+
+
 def save_checkpoint(transformer,
                     rank,
                     output_dir,
@@ -133,39 +145,52 @@ def save_checkpoint(transformer,
     """
     Save checkpoint following finetrainer's distributed checkpoint approach.
     Saves both distributed checkpoint and consolidated model weights.
+
+    When all trainable params are plain (non-FSDP) tensors (e.g. temporal-embed
+    training), dcp.save's NCCL plan-scatter fails because the plan for replicated
+    CPU tensors is communicated via NCCL.  In that case we skip dcp.save and
+    save the optimizer state with torch.save on rank 0 instead.
     """
     if os.path.exists(output_dir):
         remove_previous_state(output_dir, rank)
     save_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(save_dir, exist_ok=True)
 
-    states = {
-        "model": ModelWrapper(transformer),
-        "random_state": RandomStateWrapper(noise_generator),
-    }
+    use_dcp = _has_fsdp_trainable_params(transformer)
 
-    if optimizer is not None:
-        states["optimizer"] = OptimizerWrapper(transformer, optimizer)
+    if use_dcp:
+        states = {
+            "model": ModelWrapper(transformer),
+            "random_state": RandomStateWrapper(noise_generator),
+        }
+        if optimizer is not None:
+            states["optimizer"] = OptimizerWrapper(transformer, optimizer)
+        if dataloader is not None:
+            states["dataloader"] = dataloader
+        if scheduler is not None:
+            states["scheduler"] = SchedulerWrapper(scheduler)
 
-    if dataloader is not None:
-        states["dataloader"] = dataloader
-
-    if scheduler is not None:
-        states["scheduler"] = SchedulerWrapper(scheduler)
-    dcp_dir = os.path.join(save_dir, "distributed_checkpoint")
-    logger.info("rank: %s, saving distributed checkpoint to %s",
-                rank,
-                dcp_dir,
-                local_main_process_only=False)
-
-    begin_time = time.perf_counter()
-    dcp.save(states, checkpoint_id=dcp_dir)
-    end_time = time.perf_counter()
-
-    logger.info("rank: %s, distributed checkpoint saved in %.2f seconds",
-                rank,
-                end_time - begin_time,
-                local_main_process_only=False)
+        dcp_dir = os.path.join(save_dir, "distributed_checkpoint")
+        logger.info("rank: %s, saving distributed checkpoint to %s",
+                    rank, dcp_dir, local_main_process_only=False)
+        begin_time = time.perf_counter()
+        dcp.save(states, checkpoint_id=dcp_dir)
+        end_time = time.perf_counter()
+        logger.info("rank: %s, distributed checkpoint saved in %.2f seconds",
+                    rank, end_time - begin_time, local_main_process_only=False)
+    else:
+        # All trainable params are plain (non-FSDP) CPU tensors.
+        # Skip dcp.save (which uses NCCL for plan scatter and fails for
+        # replicated CPU tensors) and use torch.save for optimizer state.
+        logger.info("rank: %s, skipping dcp.save (no FSDP trainable params); "
+                    "using torch.save for optimizer state", rank,
+                    local_main_process_only=False)
+        if rank == 0 and optimizer is not None:
+            optim_path = os.path.join(save_dir, "optimizer.pt")
+            torch.save(optimizer.state_dict(), optim_path)
+            logger.info("rank: %s, optimizer state saved to %s", rank,
+                        optim_path, local_main_process_only=False)
+        dist.barrier()
 
     cpu_state = gather_state_dict_on_cpu_rank0(transformer, device=None)
     if rank == 0:
@@ -207,55 +232,74 @@ def load_checkpoint(transformer,
                     scheduler=None,
                     noise_generator=None) -> int:
     """
-    Load checkpoint following finetrainer's distributed checkpoint approach.
+    Load checkpoint.  Supports two formats:
+    - dcp format (distributed_checkpoint/ dir): used for FSDP trainable params
+    - simple format (transformer/diffusion_pytorch_model.safetensors + optimizer.pt):
+      used for non-FSDP param training (e.g. temporal embed)
     Returns the step number from which training should resume.
     """
     if not os.path.exists(checkpoint_path):
         logger.warning("Checkpoint path %s does not exist", checkpoint_path)
         return 0
 
-    # Extract step number from checkpoint path
     step = int(os.path.basename(checkpoint_path).split('-')[-1])
-
-    if rank == 0:
-        logger.info("Loading checkpoint from step %s", step)
+    logger.info("rank: %s, loading checkpoint from step %s", rank, step,
+                local_main_process_only=False)
 
     dcp_dir = os.path.join(checkpoint_path, "distributed_checkpoint")
+    optim_pt = os.path.join(checkpoint_path, "optimizer.pt")
+    weights_path = os.path.join(checkpoint_path, "transformer",
+                                "diffusion_pytorch_model.safetensors")
 
-    if not os.path.exists(dcp_dir):
-        logger.warning("Distributed checkpoint directory %s does not exist",
-                       dcp_dir)
+    if os.path.exists(dcp_dir):
+        # FSDP distributed checkpoint format
+        states = {
+            "model": ModelWrapper(transformer),
+            "random_state": RandomStateWrapper(noise_generator),
+        }
+        if optimizer is not None:
+            states["optimizer"] = OptimizerWrapper(transformer, optimizer)
+        if dataloader is not None:
+            states["dataloader"] = dataloader
+        if scheduler is not None:
+            states["scheduler"] = SchedulerWrapper(scheduler)
+
+        logger.info("rank: %s, loading distributed checkpoint from %s",
+                    rank, dcp_dir, local_main_process_only=False)
+        begin_time = time.perf_counter()
+        dcp.load(states, checkpoint_id=dcp_dir)
+        end_time = time.perf_counter()
+        logger.info("rank: %s, distributed checkpoint loaded in %.2f seconds",
+                    rank, end_time - begin_time, local_main_process_only=False)
+
+    elif os.path.exists(weights_path):
+        # Simple format: load model weights from safetensors, optimizer from torch.save
+        from safetensors.torch import load_file
+        logger.info("rank: %s, loading model weights from %s",
+                    rank, weights_path, local_main_process_only=False)
+        sd = load_file(weights_path)
+        # Load into the model (strict=False since only trainable params are saved)
+        missing, unexpected = transformer.load_state_dict(sd, strict=False)
+        if rank == 0:
+            if missing:
+                logger.info("load_state_dict missing keys (expected for frozen params): %d",
+                            len(missing))
+            if unexpected:
+                logger.warning("load_state_dict unexpected keys: %s", unexpected)
+
+        if optimizer is not None and os.path.exists(optim_pt):
+            logger.info("rank: %s, loading optimizer state from %s",
+                        rank, optim_pt, local_main_process_only=False)
+            optim_state = torch.load(optim_pt, map_location="cpu")
+            optimizer.load_state_dict(optim_state)
+        elif optimizer is not None:
+            logger.warning("rank: %s, no optimizer.pt found at %s — optimizer state not restored",
+                           rank, checkpoint_path)
+    else:
+        logger.warning("rank: %s, no loadable checkpoint found at %s", rank, checkpoint_path)
         return 0
 
-    states = {
-        "model": ModelWrapper(transformer),
-        "random_state": RandomStateWrapper(noise_generator),
-    }
-
-    if optimizer is not None:
-        states["optimizer"] = OptimizerWrapper(transformer, optimizer)
-
-    if dataloader is not None:
-        states["dataloader"] = dataloader
-
-    if scheduler is not None:
-        states["scheduler"] = SchedulerWrapper(scheduler)
-
-    logger.info("rank: %s, loading distributed checkpoint from %s",
-                rank,
-                dcp_dir,
-                local_main_process_only=False)
-
-    begin_time = time.perf_counter()
-    dcp.load(states, checkpoint_id=dcp_dir)
-    end_time = time.perf_counter()
-
-    logger.info("rank: %s, distributed checkpoint loaded in %.2f seconds",
-                rank,
-                end_time - begin_time,
-                local_main_process_only=False)
     logger.info("--> checkpoint loaded from step %s", step)
-
     return step
 
 

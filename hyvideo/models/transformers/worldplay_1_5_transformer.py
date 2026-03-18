@@ -219,7 +219,7 @@ class MMDoubleStreamBlock(nn.Module):
         )
 
     # modulating module for img embedding
-    def modulate_img(self, vec, img):
+    def modulate_img(self, vec, img, temporal_img_shift=None):
         (
             img_mod1_shift,
             img_mod1_scale,
@@ -233,6 +233,8 @@ class MMDoubleStreamBlock(nn.Module):
         img_modulated = modulate(
             img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
         )
+        if temporal_img_shift is not None:
+            img_modulated = img_modulated + temporal_img_shift
 
         img_q = self.img_attn_q(img_modulated)
         img_k = self.img_attn_k(img_modulated)
@@ -312,6 +314,7 @@ class MMDoubleStreamBlock(nn.Module):
         Ks: Optional[torch.Tensor] = None,
         kv_cache: Optional[dict] = None,
         cache_vision: bool = False,
+        temporal_img_shift: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
             img_q,
@@ -321,7 +324,7 @@ class MMDoubleStreamBlock(nn.Module):
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.modulate_img(vec, img)
+        ) = self.modulate_img(vec, img, temporal_img_shift=temporal_img_shift)
 
         # Add camera pose conditioning through ProPE (Projective Positional Encoding)
         # delete rope components (original attn included)
@@ -396,6 +399,7 @@ class MMDoubleStreamBlock(nn.Module):
         block_idx=None,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
+        temporal_img_shift: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
             img_q,
@@ -405,7 +409,7 @@ class MMDoubleStreamBlock(nn.Module):
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.modulate_img(vec, img)
+        ) = self.modulate_img(vec, img, temporal_img_shift=temporal_img_shift)
         (
             txt_q,
             txt_k,
@@ -1315,6 +1319,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         cache_vision: bool = False,
         rope_temporal_size=4,
         start_rope_start_idx=0,
+        temporal_start_idx: int = 0,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         if cache_vision:
             _kv_cache_new = []
@@ -1350,6 +1355,12 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             freqs_sin = freqs_sin[start_index:end_index, ...]
 
         img = self.img_in(img)
+
+        if hasattr(self, 'temporal_frame_embed'):
+            frame_ids = torch.arange(temporal_start_idx, temporal_start_idx + tt, device=self.temporal_frame_embed.weight.device)
+            t_emb = self.temporal_frame_embed(frame_ids).to(img.device, img.dtype)
+            t_emb = t_emb.unsqueeze(1).expand(-1, th * tw, -1).reshape(1, tt * th * tw, -1)
+            img = img + t_emb
 
         action = action.reshape(-1)
         t = t.reshape(-1)
@@ -1389,8 +1400,19 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
         # Pass through double-stream blocks
+        _per_block_embeds = getattr(self, 'temporal_frame_embed_blocks', None)
+        _N_local = img.shape[1]
+        _sp_rank = parallel_dims.sp_rank if sp_enabled else 0
         for index, block in enumerate(self.double_blocks):
             self.attn_param["layer-name"] = f"double_block_{index + 1}"
+
+            temporal_img_shift = None
+            if _per_block_embeds is not None:
+                emb = _per_block_embeds[index]
+                global_start = _sp_rank * _N_local + temporal_start_idx * (th * tw)
+                global_indices = torch.arange(global_start, global_start + _N_local, device=img.device)
+                frame_ids = global_indices // (th * tw)
+                temporal_img_shift = emb(frame_ids).to(img.device, img.dtype).unsqueeze(0)
 
             img, vision_kv = block(
                 bi_inference=False,
@@ -1405,6 +1427,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                 Ks=Ks,
                 kv_cache=kv_cache,
                 cache_vision=cache_vision,
+                temporal_img_shift=temporal_img_shift,
             )
             if cache_vision:
                 _kv_cache_new[index]["k_vision"] = vision_kv["k_vision"]
@@ -1463,6 +1486,13 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw))
 
         img = self.img_in(img)
+
+        if hasattr(self, 'temporal_frame_embed'):
+            frame_ids = torch.arange(tt, device=self.temporal_frame_embed.weight.device)
+            t_emb = self.temporal_frame_embed(frame_ids).to(img.device, img.dtype)
+            t_emb = t_emb.unsqueeze(1).expand(-1, th * tw, -1).reshape(1, tt * th * tw, -1)
+            img = img + t_emb
+
         vec = self.time_in(t)
 
         if text_states_2 is not None:
@@ -1520,9 +1550,18 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             mask_type,
         )
 
+        if hasattr(self, 'temporal_token_embed'):
+            frame_ids = torch.arange(tt, device=self.temporal_token_embed.weight.device)
+            t_tokens = self.temporal_token_embed(frame_ids).to(txt.device, txt.dtype)
+            t_tokens = t_tokens.unsqueeze(0).repeat_interleave(20, dim=1)  # [1, tt*20, hidden_size]
+            txt = torch.cat([txt, t_tokens], dim=1)
+
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
         # Pass through double-stream blocks
+        _per_block_embeds = getattr(self, 'temporal_frame_embed_blocks', None)
+        _N_local = img.shape[1]
+        _sp_rank = parallel_dims.sp_rank if sp_enabled else 0
         for index, block in enumerate(self.double_blocks):
             force_full_attn = (
                 self.attn_mode in ["flex-block-attn"]
@@ -1534,6 +1573,15 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                 )
             )
             self.attn_param["layer-name"] = f"double_block_{index + 1}"
+
+            temporal_img_shift = None
+            if _per_block_embeds is not None:
+                emb = _per_block_embeds[index]
+                global_start = _sp_rank * _N_local
+                global_indices = torch.arange(global_start, global_start + _N_local, device=img.device)
+                frame_ids = global_indices // (th * tw)
+                temporal_img_shift = emb(frame_ids).to(img.device, img.dtype).unsqueeze(0)
+
             if viewmats is not None:
                 img, txt = block(
                     bi_inference=True,
@@ -1550,6 +1598,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                     block_idx=index,
                     viewmats=viewmats,
                     Ks=Ks,
+                    temporal_img_shift=temporal_img_shift,
                 )
             else:
                 img, txt = block(
@@ -1565,6 +1614,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                     attn_param=self.attn_param,
                     is_flash=force_full_attn,
                     block_idx=index,
+                    temporal_img_shift=temporal_img_shift,
                 )
 
         # Final Layer

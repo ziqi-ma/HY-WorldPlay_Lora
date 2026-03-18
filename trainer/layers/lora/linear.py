@@ -20,7 +20,8 @@ from trainer.layers.linear import (ColumnParallelLinear, LinearBase,
 from trainer.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from trainer.utils import get_mixed_precision_state
 
-torch._dynamo.config.recompile_limit = 16
+if hasattr(torch._dynamo.config, "recompile_limit"):
+    torch._dynamo.config.recompile_limit = 16
 
 
 class BaseLayerWithLoRA(nn.Module):

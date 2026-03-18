@@ -152,6 +152,8 @@ class Muon(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
+                if buf.device != g.device:
+                    buf = state["momentum_buffer"] = buf.to(g.device)
                 buf.mul_(momentum).add_(g)
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)
@@ -192,6 +194,9 @@ class Muon(torch.optim.Optimizer):
                 step = state["step"]
                 buf1 = state["moment1"]
                 buf2 = state["moment2"]
+                if buf1.device != g.device:
+                    buf1 = state["moment1"] = buf1.to(g.device)
+                    buf2 = state["moment2"] = buf2.to(g.device)
                 buf1.lerp_(g, 1 - beta1)
                 buf2.lerp_(g.square(), 1 - beta2)
 
@@ -215,7 +220,7 @@ def get_muon_optimizer(model,
     muon_params = [
         p
         for name, p in model.named_parameters()
-        if p.requires_grad and p.ndim >= 2 
+        if p.requires_grad and p.ndim >= 2
     ]
     adamw_params = [
         p

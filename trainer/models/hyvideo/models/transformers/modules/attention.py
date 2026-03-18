@@ -206,33 +206,30 @@ def sequence_parallel_attention(q, k, v,
         key = torch.cat([encoder_key, key], dim=1)
         value = torch.cat([encoder_value, value], dim=1)
 
-        # prepare causal mask for chunk-wise attention
-        latent_seq_length = 1560      # set for hunyuanvideo 1.5, which is for 480 * 832 resolution
+        # Chunked causal attention — avoids materialising the O(S²) dense mask.
+        # text tokens attend to text only; vision chunk i attends to text + chunks 0..i.
         chunk_seq_length = 1560 * 4
-        chunk_num = (vision_seq_length) // chunk_seq_length
-        causal_mask = torch.zeros((total_seq_length, total_seq_length), device=query.device)
-        causal_mask[:, :text_seq_length] = 1  # no attention for the rest
+        chunk_num = vision_seq_length // chunk_seq_length
+
+        # query/key/value are [B, text+vision, local_H, D] at this point
+        hidden_states = torch.zeros_like(query)   # [B, total_seq, local_H, D]
+
+        # text tokens → attend to text only
+        q_txt = query[:, :text_seq_length].transpose(1, 2)   # [B, H, text, D]
+        k_txt = key[:, :text_seq_length].transpose(1, 2)
+        v_txt = value[:, :text_seq_length].transpose(1, 2)
+        hidden_states[:, :text_seq_length] = F.scaled_dot_product_attention(
+            q_txt, k_txt, v_txt, dropout_p=0.0, is_causal=False).transpose(1, 2)
+
+        # vision chunk i → attend to text + chunks 0..i (no dense mask needed)
         for i in range(chunk_num):
-            start_i = text_seq_length + i * chunk_seq_length
-            end_i = min(start_i + chunk_seq_length, total_seq_length)
-            for j in range(i + 1):
-                start_j = text_seq_length + j * chunk_seq_length
-                end_j = min(start_j + chunk_seq_length, total_seq_length)
-                # full attention within chunk i for j == i, causal for j < i
-                causal_mask[start_i:end_i, start_j:end_j] = 1
-
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # 1, 1, S, S
-        causal_mask = causal_mask.expand(query.shape[0], 1, -1, -1)
-        causal_mask = causal_mask.to(torch.bool)  # Force bool dtype
-
-        query = query.transpose(1, 2)  # B * H * L * D
-        key = key.transpose(1, 2)      # B * H * L * D
-        value = value.transpose(1, 2)  # B * H * L * D
-
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=causal_mask, dropout_p=0.0, is_causal=False)
-        
-        # transpose back
-        hidden_states = hidden_states.transpose(1, 2)   # [B, S, H, D]
+            vs = text_seq_length + i * chunk_seq_length
+            ve = min(vs + chunk_seq_length, total_seq_length)
+            q_i = query[:, vs:ve].transpose(1, 2)    # [B, H, chunk, D]
+            k_i = key[:, :ve].transpose(1, 2)        # [B, H, text + chunks 0..i, D]
+            v_i = value[:, :ve].transpose(1, 2)
+            hidden_states[:, vs:ve] = F.scaled_dot_product_attention(
+                q_i, k_i, v_i, dropout_p=0.0, is_causal=False).transpose(1, 2)
 
         # return back to the original order: [query, encoder_query]
         hidden_states, encoder_hidden_states = hidden_states[:, text_seq_length:, :, :], hidden_states[:, :text_seq_length, :, :]

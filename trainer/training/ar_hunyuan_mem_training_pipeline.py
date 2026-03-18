@@ -173,6 +173,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
             seed=self.seed,
             cfg_rate=training_args.training_cfg_rate,
             i2v_rate=training_args.i2v_rate,
+            neg_prompt_path=training_args.neg_prompt_path,
+            neg_byt5_path=training_args.neg_byt5_path,
         )
 
         self.num_update_steps_per_epoch = math.ceil(
@@ -318,7 +320,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
         indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
         indices = (self.noise_scheduler.config.num_train_timesteps - self.timestep_transform(indices, self.train_time_shift)).long()
         # TO DO: change the noise, for outside window, only add noise to the outside part
-        if training_batch.select_window_out_flag == 1:    # select as memory training
+        if training_batch.select_window_out_flag == 1 and not (self.training_args.temporal_embed_training or getattr(self.training_args, 'temporal_token_training', False) or getattr(self.training_args, 'temporal_embed_per_block_training', False)):    # select as memory training
             for i in range(0, indices.shape[0] - 4, 4):
                 rand_val = torch.randint(500, 985, (1, ), device=latents.device)
                 indices[i:i + 4] = rand_val
@@ -480,8 +482,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
             assert training_batch.noise is not None
             target = training_batch.latents if self.training_args.precondition_outputs else training_batch.noise - training_batch.latents
             i2v_mask = training_batch.i2v_mask
-            if training_batch.select_window_out_flag == 1 and self.causal:
-                i2v_mask[:,:,:-4,...] = 0 # only compute the last chunk for outside window training 
+            if training_batch.select_window_out_flag == 1 and self.causal and not (self.training_args.temporal_embed_training or getattr(self.training_args, 'temporal_token_training', False) or getattr(self.training_args, 'temporal_embed_per_block_training', False)):
+                i2v_mask[:,:,:-4,...] = 0 # only compute the last chunk for outside window training
             assert model_pred.shape == target.shape, f"model_pred.shape: {model_pred.shape}, target.shape: {target.shape}"
 
             diff = (model_pred.float() * i2v_mask - target.float() * i2v_mask) ** 2
@@ -569,8 +571,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
         if not self.post_init_called:
             self.post_init()
         num_trainable_params = _get_trainable_params(self.transformer)
-        logger.info("Starting training with %s B trainable parameters",
-                    round(num_trainable_params / 1e9, 3))
+        logger.info("Starting training with %s trainable parameters",
+                    f"{num_trainable_params:,}")
 
         # Set random seeds for deterministic training
         self.noise_random_generator = torch.Generator(device="cpu").manual_seed(
@@ -585,6 +587,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
         if self.training_args.resume_from_checkpoint:
             self._resume_from_checkpoint()
+            self._maybe_eval(self.init_steps)
 
         self.train_loader_iter = iter(self.train_dataloader)
 
@@ -636,17 +639,27 @@ class TrainingPipeline(LoRAPipeline, ABC):
             })
             progress_bar.update(1)
             if self.global_rank == 0:
-                wandb.log(
-                    {
-                        "train_loss": loss,
-                        "learning_rate": self.lr_scheduler.get_last_lr()[0],
-                        "step_time": step_time,
-                        "avg_step_time": avg_step_time,
-                        "grad_norm": grad_norm,
-                        "vsa_sparsity": current_vsa_sparsity,
-                    },
-                    step=step,
-                )
+                log_dict = {
+                    "train_loss": loss,
+                    "learning_rate": self.lr_scheduler.get_last_lr()[0],
+                    "step_time": step_time,
+                    "avg_step_time": avg_step_time,
+                    "grad_norm": grad_norm,
+                    "vsa_sparsity": current_vsa_sparsity,
+                }
+                for attr in ["temporal_frame_embed", "temporal_token_embed"]:
+                    if hasattr(self.transformer, attr):
+                        w = getattr(self.transformer, attr).weight
+                        if hasattr(w, "full_tensor"):
+                            w = w.full_tensor()
+                        log_dict[f"{attr}_norm"] = w.float().norm().item()
+                if hasattr(self.transformer, "temporal_frame_embed_blocks"):
+                    all_w = torch.stack([
+                        emb.weight.full_tensor() if hasattr(emb.weight, "full_tensor") else emb.weight
+                        for emb in self.transformer.temporal_frame_embed_blocks
+                    ])
+                    log_dict["temporal_frame_embed_blocks_norm"] = all_w.float().norm().item()
+                wandb.log(log_dict, step=step)
 
             if step % self.training_args.checkpointing_steps == 0:
                 save_checkpoint(self.transformer, self.global_rank,
@@ -655,6 +668,9 @@ class TrainingPipeline(LoRAPipeline, ABC):
                                 self.lr_scheduler, self.noise_random_generator)
                 self.transformer.train()
                 self.sp_group.barrier()
+
+            if step % self.training_args.validation_steps == 0:
+                self._maybe_eval(step)
 
         wandb.finish()
         save_checkpoint(self.transformer, self.global_rank,
@@ -665,6 +681,10 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
         if get_sp_group():
             cleanup_dist_env_and_memory()
+
+    def _maybe_eval(self, step: int) -> None:
+        """Hook called every validation_steps. No-op by default; override in subclasses."""
+        pass
 
     def _log_training_info(self) -> None:
         total_batch_size = (self.world_size *
@@ -686,8 +706,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     self.training_args.gradient_accumulation_steps)
         logger.info("  Total optimization steps = %s",
                     self.training_args.max_train_steps)
-        logger.info("  Total training parameters per FSDP shard = %s B",
-                    round(_get_trainable_params(self.transformer) / 1e9, 3))
+        logger.info("  Total training parameters per FSDP shard = %s",
+                    f"{_get_trainable_params(self.transformer):,}")
         # print dtype
         logger.info("  Master weight dtype: %s",
                     self.transformer.parameters().__next__().dtype)

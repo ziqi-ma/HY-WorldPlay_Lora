@@ -792,12 +792,15 @@ def init_distributed_environment(
             "distributed environment")
 
         # For MPS, don't pass device_id as it doesn't support device indices
+        import datetime
+        _pg_timeout = datetime.timedelta(hours=2)
         if current_platform.is_mps():
             torch.distributed.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=world_size,
-                rank=rank)
+                rank=rank,
+                timeout=_pg_timeout)
         else:
             # this backend is used for WORLD
             torch.distributed.init_process_group(
@@ -805,7 +808,8 @@ def init_distributed_environment(
                 init_method=distributed_init_method,
                 world_size=world_size,
                 rank=rank,
-                device_id=device_id)
+                device_id=device_id,
+                timeout=_pg_timeout)
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816

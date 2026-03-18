@@ -1220,6 +1220,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                             rope_temporal_size=latents_concat.shape[2]
                             + len(selected_frame_indices),
                             start_rope_start_idx=len(selected_frame_indices),
+                            temporal_start_idx=start_idx,
                         )[0]
                         if self.do_classifier_free_guidance:
                             noise_pred_uncond = self.transformer(
@@ -1239,6 +1240,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                                 rope_temporal_size=latents_concat.shape[2]
                                 + len(selected_frame_indices),
                                 start_rope_start_idx=len(selected_frame_indices),
+                                temporal_start_idx=start_idx,
                             )[0]
 
                     if self.do_classifier_free_guidance:

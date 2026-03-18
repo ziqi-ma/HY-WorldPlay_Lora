@@ -452,6 +452,28 @@ class TransformerLoader(ComponentLoader):
             training_mode=trainer_args.training_mode)
 
 
+        if getattr(trainer_args, "temporal_embed_training", False):
+            model.add_temporal_embed_parameters(
+                max_frames=getattr(trainer_args, "temporal_embed_max_frames", 65)
+            )
+            logger.info("Added temporal frame embeddings (max_frames=%d)",
+                        getattr(trainer_args, "temporal_embed_max_frames", 65))
+
+        if getattr(trainer_args, "temporal_token_training", False):
+            model.add_temporal_token_parameters(
+                max_frames=getattr(trainer_args, "temporal_embed_max_frames", 65)
+            )
+            logger.info("Added temporal token embeddings (max_frames=%d)",
+                        getattr(trainer_args, "temporal_embed_max_frames", 65))
+
+        if getattr(trainer_args, "temporal_embed_per_block_training", False):
+            model.add_temporal_embed_per_block_parameters(
+                max_frames=getattr(trainer_args, "temporal_embed_max_frames", 65)
+            )
+            logger.info("Added per-block temporal frame embeddings (%d blocks, max_frames=%d)",
+                        len(model.double_blocks),
+                        getattr(trainer_args, "temporal_embed_max_frames", 65))
+
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 

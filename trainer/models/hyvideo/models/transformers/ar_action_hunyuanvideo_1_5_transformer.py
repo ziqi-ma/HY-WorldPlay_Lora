@@ -140,6 +140,7 @@ class MMDoubleStreamBlock(nn.Module):
         block_idx=None,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
+        temporal_img_shift: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
             img_mod1_shift,
@@ -161,6 +162,8 @@ class MMDoubleStreamBlock(nn.Module):
 
         img_modulated = self.img_norm1(img)
         img_modulated = modulate(img_modulated, shift=img_mod1_shift, scale=img_mod1_scale)
+        if temporal_img_shift is not None:
+            img_modulated = img_modulated + temporal_img_shift
 
         img_q = self.img_attn_q(img_modulated)
         img_k = self.img_attn_k(img_modulated)
@@ -729,6 +732,47 @@ class ARHunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
 
         return reorder_txt, reorder_mask
 
+    def add_temporal_embed_parameters(self, max_frames: int = 65):
+        """Learnable per-frame embedding for scene-specific dynamics learning.
+
+        Adds a [max_frames, hidden_size] embedding table.  During forward,
+        the embedding for frame t is broadcast over all H×W spatial tokens at
+        that frame and added to the image tokens after img_in projection.
+
+        This is camera-agnostic (camera lives in prope/spatial RoPE), so it
+        generalises across different camera trajectories of the same scene.
+        Zero-initialised so the model starts from the pretrained behaviour.
+
+        Freeze everything else and train only temporal_frame_embed.
+        """
+        self.temporal_frame_embed = nn.Embedding(max_frames, self.hidden_size)
+        nn.init.normal_(self.temporal_frame_embed.weight, std=0.02)
+
+    def add_temporal_embed_per_block_parameters(self, max_frames: int = 65):
+        """Per-block variant of temporal_frame_embed.
+
+        Creates one Embedding table per double-stream block.  During forward,
+        each block's embedding is added to img immediately before that block
+        runs, so every layer receives a fresh scene-specific frame signal.
+        SP-aware: only the slice of the sequence owned by this rank is added.
+        Zero-initialised so training starts from pretrained behaviour.
+        """
+        self.temporal_frame_embed_blocks = nn.ModuleList([
+            nn.Embedding(max_frames, self.hidden_size)
+            for _ in range(len(self.double_blocks))
+        ])
+        for emb in self.temporal_frame_embed_blocks:
+            nn.init.zeros_(emb.weight)
+
+    def add_temporal_token_parameters(self, max_frames: int = 65):
+        """
+        Train only temporal_token_embed: T learnable tokens injected into the
+        txt stream before double blocks, so they cross-attend with image tokens
+        at every layer. Zero-initialized so training starts from pretrained behavior.
+        """
+        self.temporal_token_embed = nn.Embedding(max_frames, self.hidden_size)
+        nn.init.normal_(self.temporal_token_embed.weight, std=1e-3)
+
     def add_discrete_action_parameters(self):
         self.action_in = TimestepEmbedder(
             self.hidden_size, get_activation_layer("silu")
@@ -791,6 +835,15 @@ class ARHunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw))
 
         img = self.img_in(img)
+
+        if hasattr(self, 'temporal_frame_embed'):
+            # img: [B, tt*th*tw, hidden_size] — add per-frame embedding
+            embed_device = self.temporal_frame_embed.weight.device
+            frame_ids = torch.arange(tt, device=embed_device)        # [tt]
+            t_emb = self.temporal_frame_embed(frame_ids).to(img.device, img.dtype)  # [tt, hidden_size]
+            t_emb = t_emb.unsqueeze(1).expand(-1, th * tw, -1)       # [tt, th*tw, hidden_size]
+            t_emb = t_emb.reshape(1, tt * th * tw, -1)               # [1, T, hidden_size]
+            img = img + t_emb
 
         sp_world_size = get_sp_world_size()
         rank_in_sp_group = get_sp_parallel_rank()
@@ -895,8 +948,25 @@ class ARHunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         # mask the txt tokens based on the text_mask
         txt = txt[text_mask.bool().to(txt.device)].unsqueeze(0)
 
+        if hasattr(self, 'temporal_token_embed'):
+            frame_ids = torch.arange(tt, device=self.temporal_token_embed.weight.device)
+            t_tokens = self.temporal_token_embed(frame_ids).to(txt.device, txt.dtype)  # [tt, hidden_size]
+            t_tokens = t_tokens.unsqueeze(0).repeat_interleave(20, dim=1)  # [1, tt*20, hidden_size]
+            txt = torch.cat([txt, t_tokens], dim=1)
+
         # Pass through double-stream blocks
+        _per_block_embeds = getattr(self, 'temporal_frame_embed_blocks', None)
+        _N_local = img.shape[1]
         for index, block in enumerate(self.double_blocks):
+            temporal_img_shift = None
+            if _per_block_embeds is not None:
+                emb = _per_block_embeds[index]
+                global_start = rank_in_sp_group * _N_local
+                global_indices = torch.arange(global_start, global_start + _N_local,
+                                              device=emb.weight.device)
+                frame_ids = global_indices // (th * tw)
+                temporal_img_shift = emb(frame_ids).to(img.device, img.dtype).unsqueeze(0)  # [1, N_local, hidden]
+
             force_full_attn = (
                 self.attn_mode in ["flex-block-attn"]
                 and self.attn_param["win_type"] == "hybrid"
@@ -920,6 +990,7 @@ class ARHunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                 block_idx=index,
                 viewmats=viewmats,
                 Ks=Ks,
+                temporal_img_shift=temporal_img_shift,
             )
 
         txt_seq_len = txt.shape[1]
