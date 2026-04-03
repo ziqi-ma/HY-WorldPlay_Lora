@@ -30,9 +30,8 @@ class HunyuanTrainingPipeline(TrainingPipeline):
         pass
 
     def initialize_validation_pipeline(self, training_args: TrainingArgs):
-        if training_args.eval_steps <= 0 or not training_args.gt_frames_dir:
-            logger.info("AR eval disabled (eval_steps=%s, gt_frames_dir=%s)",
-                        training_args.eval_steps, training_args.gt_frames_dir)
+        if training_args.eval_steps <= 0:
+            logger.info("AR eval disabled (eval_steps=%s)", training_args.eval_steps)
             return
 
         if not training_args.eval_pose_string:
@@ -96,22 +95,25 @@ class HunyuanTrainingPipeline(TrainingPipeline):
 
         # ALL ranks need the reference image path (used in pipe() call)
         gt_dir = training_args.gt_frames_dir
-        gt_files = sorted([f for f in os.listdir(gt_dir) if f.endswith('.png')])
-        self.eval_image_path = training_args.eval_image_path or os.path.join(gt_dir, gt_files[0])
-
-        if self.global_rank == 0:
-            # Load GT frames (rank 0 only — for metrics)
-            from PIL import Image
-            self.gt_frames = np.stack([
-                np.array(Image.open(os.path.join(gt_dir, f)).convert('RGB'))
-                for f in gt_files
-            ])  # [T, H, W, 3] uint8
-            logger.info("Loaded %d GT frames from %s", len(self.gt_frames), gt_dir)
-
-            # LPIPS
-            import lpips
-            self.lpips_fn = lpips.LPIPS(net='alex').cuda()
-            self.lpips_fn.eval()
+        self.gt_frames = None
+        self.lpips_fn = None
+        if gt_dir:
+            gt_files = sorted([f for f in os.listdir(gt_dir) if f.endswith('.png')])
+            self.eval_image_path = training_args.eval_image_path or os.path.join(gt_dir, gt_files[0])
+            if self.global_rank == 0:
+                # Load GT frames (rank 0 only — for metrics)
+                from PIL import Image
+                self.gt_frames = np.stack([
+                    np.array(Image.open(os.path.join(gt_dir, f)).convert('RGB'))
+                    for f in gt_files
+                ])  # [T, H, W, 3] uint8
+                logger.info("Loaded %d GT frames from %s", len(self.gt_frames), gt_dir)
+                import lpips
+                self.lpips_fn = lpips.LPIPS(net='alex').cuda()
+                self.lpips_fn.eval()
+        else:
+            self.eval_image_path = training_args.eval_image_path
+            logger.info("gt_frames_dir not set — LPIPS/L2 metrics will be skipped")
 
         self.sp_group.barrier()
 
@@ -242,51 +244,51 @@ class HunyuanTrainingPipeline(TrainingPipeline):
             else:
                 video_np = np.array(video_tensor)
 
-            # --- Compute metrics ---
-            gt = self.gt_frames
-            num_frames = min(len(video_np), len(gt))
-            gen = video_np[:num_frames]
-            gt_eval = gt[:num_frames]
+            # --- Compute metrics (only if GT frames available) ---
+            if self.gt_frames is not None:
+                gt = self.gt_frames
+                num_frames = min(len(video_np), len(gt))
+                gen = video_np[:num_frames]
+                gt_eval = gt[:num_frames]
 
-            if gen.shape[1:3] != gt_eval.shape[1:3]:
-                import cv2
-                h, w = gt_eval.shape[1], gt_eval.shape[2]
-                gen = np.stack([
-                    cv2.resize(f, (w, h), interpolation=cv2.INTER_LANCZOS4)
-                    for f in gen
-                ])
+                if gen.shape[1:3] != gt_eval.shape[1:3]:
+                    import cv2
+                    h, w = gt_eval.shape[1], gt_eval.shape[2]
+                    gen = np.stack([
+                        cv2.resize(f, (w, h), interpolation=cv2.INTER_LANCZOS4)
+                        for f in gen
+                    ])
 
-            # Per-frame MSE and LPIPS
-            gen_f = gen.astype(np.float32) / 255.0
-            gt_f = gt_eval.astype(np.float32) / 255.0
+                gen_f = gen.astype(np.float32) / 255.0
+                gt_f = gt_eval.astype(np.float32) / 255.0
 
-            from torchvision import transforms
-            to_tensor = transforms.ToTensor()
-            mse_scores = []
-            lpips_scores = []
-            for i in range(num_frames):
-                mse_scores.append(float(np.mean((gen_f[i] - gt_f[i]) ** 2)))
-                gen_t = to_tensor(gen[i]).unsqueeze(0).cuda() * 2 - 1
-                gt_t = to_tensor(gt_eval[i]).unsqueeze(0).cuda() * 2 - 1
-                lpips_scores.append(self.lpips_fn(gen_t, gt_t).item())
+                from torchvision import transforms
+                to_tensor = transforms.ToTensor()
+                mse_scores = []
+                lpips_scores = []
+                for i in range(num_frames):
+                    mse_scores.append(float(np.mean((gen_f[i] - gt_f[i]) ** 2)))
+                    gen_t = to_tensor(gen[i]).unsqueeze(0).cuda() * 2 - 1
+                    gt_t = to_tensor(gt_eval[i]).unsqueeze(0).cuda() * 2 - 1
+                    lpips_scores.append(self.lpips_fn(gen_t, gt_t).item())
 
-            l2_mean = float(np.mean(mse_scores))
-            lpips_mean = float(np.mean(lpips_scores))
+                l2_mean = float(np.mean(mse_scores))
+                lpips_mean = float(np.mean(lpips_scores))
 
-            logger.info("Eval step %d: MSE=%.6f, LPIPS=%.4f (%d frames)",
-                        step, l2_mean, lpips_mean, num_frames)
-            logger.info("  per-frame MSE : %s",
-                        [f"{v:.5f}" for v in mse_scores])
-            logger.info("  per-frame LPIPS: %s",
-                        [f"{v:.4f}" for v in lpips_scores])
-            wandb.log({
-                "eval/l2_mse": l2_mean,
-                "eval/lpips": lpips_mean,
-                "eval/mse_first_frame": mse_scores[0],
-                "eval/mse_last_frame": mse_scores[-1],
-                "eval/lpips_first_frame": lpips_scores[0],
-                "eval/lpips_last_frame": lpips_scores[-1],
-            }, step=step)
+                logger.info("Eval step %d: MSE=%.6f, LPIPS=%.4f (%d frames)",
+                            step, l2_mean, lpips_mean, num_frames)
+                logger.info("  per-frame MSE : %s",
+                            [f"{v:.5f}" for v in mse_scores])
+                logger.info("  per-frame LPIPS: %s",
+                            [f"{v:.4f}" for v in lpips_scores])
+                wandb.log({
+                    "eval/l2_mse": l2_mean,
+                    "eval/lpips": lpips_mean,
+                    "eval/mse_first_frame": mse_scores[0],
+                    "eval/mse_last_frame": mse_scores[-1],
+                    "eval/lpips_first_frame": lpips_scores[0],
+                    "eval/lpips_last_frame": lpips_scores[-1],
+                }, step=step)
 
             # Save video
             import imageio

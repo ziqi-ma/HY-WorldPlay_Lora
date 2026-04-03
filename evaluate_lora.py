@@ -261,14 +261,9 @@ def main():
             video_np = np.array(video_tensor)
 
         # Save generated video
-        import cv2
+        import imageio
         save_path = os.path.join(args.output_path, "eval_gen.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        h, w = video_np.shape[1], video_np.shape[2]
-        writer = cv2.VideoWriter(save_path, fourcc, 24, (w, h))
-        for frame in video_np:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        writer.release()
+        imageio.mimsave(save_path, video_np, fps=24, codec="libx264", quality=8)
         print(f"Saved generated video to {save_path} ({video_np.shape[0]} frames)")
 
         # Save individual generated frames
