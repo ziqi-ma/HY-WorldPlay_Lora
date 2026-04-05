@@ -29,19 +29,40 @@ class HunyuanTrainingPipeline(TrainingPipeline):
     def create_training_stages(self, training_args: TrainingArgs):
         pass
 
+    def _discover_eval_poses(self, training_args: TrainingArgs):
+        """Build list of (name, pose_data) for evaluation.
+
+        Sources (in priority order):
+        1. eval_pose_dir — directory containing subdirs, each with a pose.json
+        2. eval_pose_string — single pose string
+        Returns a list of (name, pose_data) tuples where pose_data is either a
+        file path (str ending in .json) or a pose string.
+        """
+        poses = []
+        pose_dir = getattr(training_args, 'eval_pose_dir', '')
+        if pose_dir and os.path.isdir(pose_dir):
+            for sub in sorted(os.listdir(pose_dir)):
+                pf = os.path.join(pose_dir, sub, 'pose.json')
+                if os.path.isfile(pf):
+                    poses.append((sub, pf))
+        if not poses and training_args.eval_pose_string:
+            poses.append(("pose", training_args.eval_pose_string))
+        return poses
+
     def initialize_validation_pipeline(self, training_args: TrainingArgs):
         if training_args.eval_steps <= 0:
             logger.info("AR eval disabled (eval_steps=%s)", training_args.eval_steps)
             return
 
-        if not training_args.eval_pose_string:
-            logger.info("AR eval disabled: eval_pose_string not set")
+        self.eval_poses = self._discover_eval_poses(training_args)
+        if not self.eval_poses:
+            logger.info("AR eval disabled: no eval_pose_dir or eval_pose_string set")
             return
 
         self.eval_enabled = True
-        logger.info("AR eval enabled: every %d steps, GT from %s, pose='%s'",
-                    training_args.eval_steps, training_args.gt_frames_dir,
-                    training_args.eval_pose_string)
+        pose_names = [n for n, _ in self.eval_poses]
+        logger.info("AR eval enabled: every %d steps, %d pose(s): %s",
+                    training_args.eval_steps, len(self.eval_poses), pose_names)
 
         # Import hyvideo.generate on ALL ranks — its module-level code calls
         # initialize_parallel_state(sp=WORLD_SIZE) which is a collective op.
@@ -83,7 +104,7 @@ class HunyuanTrainingPipeline(TrainingPipeline):
             "img_attn_q", "img_attn_k", "img_attn_v", "img_attn_proj",
             "img_attn_prope_proj",
             "txt_attn_q", "txt_attn_k", "txt_attn_v", "txt_attn_proj",
-            "linear1_q", "linear1_k", "linear1_v",
+            "img_mlp", "txt_mlp",
         ]
         self.eval_base_weights = {}
         for name, module in self.eval_pipe.transformer.named_modules():
@@ -118,41 +139,27 @@ class HunyuanTrainingPipeline(TrainingPipeline):
         self.sp_group.barrier()
 
     @torch.no_grad()
-    def _log_ar_validation(self, step):
-        """
-        Full AR rollout evaluation using the inference pipeline
-        (HunyuanVideo_1_5_Pipeline) with sp=8 (all ranks participate).
-
-        ALL ranks: gather LoRA, broadcast, merge, run inference.
-        Only rank 0: compute metrics, save video.
-        """
-        import wandb
+    def _merge_lora_into_eval_pipe(self):
+        """Gather LoRA weights, broadcast, and merge into eval pipeline.
+        Must be called by ALL ranks. Returns the number of merged layers."""
         import torch.distributed as dist
         from trainer.training.training_utils import gather_state_dict_on_cpu_rank0
 
         training_args = self.training_args
-        if not getattr(self, 'eval_enabled', False):
-            return
 
-        logger.info("Starting AR eval at step %d (sp=8, all ranks)", step)
-        self.transformer.eval()
-
-        # --- ALL ranks: Gather LoRA weights to rank 0 ---
-        lora_state_dict = gather_state_dict_on_cpu_rank0(self.transformer, device=None)
-
-        # --- ALL ranks: Restore base weights ---
+        # Restore base weights on ALL ranks
         for name, module in self.eval_pipe.transformer.named_modules():
             if name in self.eval_base_weights:
                 module.weight.data.copy_(self.eval_base_weights[name])
 
-        # --- ALL ranks: Broadcast and merge LoRA weights ---
+        # Gather LoRA weights to rank 0
+        lora_state_dict = gather_state_dict_on_cpu_rank0(self.transformer, device=None)
+
         lora_rank = training_args.lora_rank
         lora_alpha = training_args.lora_alpha
         scale = lora_alpha / lora_rank
 
-        # Rank 0 has the gathered state dict; broadcast LoRA tensors to all ranks
         if self.global_rank == 0:
-            # Collect LoRA key-value pairs that match target modules
             lora_pairs = {}
             for name, module in self.eval_pipe.transformer.named_modules():
                 if not isinstance(module, torch.nn.Linear):
@@ -173,43 +180,41 @@ class HunyuanTrainingPipeline(TrainingPipeline):
             logger.info("Gathered %d LoRA weight tensors, %d layer pairs to merge",
                         len(lora_state_dict), len(lora_pairs))
             if len(lora_pairs) == 0:
-                logger.warning("No LoRA pairs matched! Check that gathered "
-                               "state-dict keys align with eval-pipe module names. "
-                               "First 5 state-dict keys: %s",
+                logger.warning("No LoRA pairs matched! First 5 state-dict keys: %s",
                                list(lora_state_dict.keys())[:5])
         else:
             lora_pairs = None
 
-        # Broadcast the lora_pairs dict from rank 0 to all ranks
         lora_pairs_list = [lora_pairs]
         dist.broadcast_object_list(lora_pairs_list, src=0)
         lora_pairs = lora_pairs_list[0]
 
-        # Merge on ALL ranks
         merged_count = 0
         for name, module in self.eval_pipe.transformer.named_modules():
             if name not in lora_pairs:
                 continue
             lora_A, lora_B = lora_pairs[name]
-            # Training forward computes x @ (B @ A), but nn.Linear computes
-            # x @ W.T.  To match, we need W_new = W + scale*(B @ A).T so that
-            # x @ W_new.T = x @ W.T + scale * x @ (B @ A).
             module.weight.data += scale * (
                 lora_B.to(module.weight.device, dtype=module.weight.dtype)
                 @ lora_A.to(module.weight.device, dtype=module.weight.dtype)
-            ).T
+            )
             merged_count += 1
         logger.info("Rank %d: merged LoRA into %d layers (scale=%.2f)",
                     self.global_rank, merged_count, scale)
+        return merged_count
 
-        # --- ALL ranks: Prepare pose/action data ---
+    def _run_eval_single_pose(self, pose_name, pose_data, step):
+        """Run inference for a single pose on ALL ranks. Rank 0 saves video."""
+        import wandb
+
+        training_args = self.training_args
         video_length = training_args.num_frames
         latent_num = (video_length - 1) // 4 + 1
-        viewmats, Ks, action = self._pose_to_input(
-            training_args.eval_pose_string, latent_num
-        )
 
-        # --- ALL ranks: Run full inference (sp=8) ---
+        # pose_to_input handles both w2c/intrinsic and extrinsic/K formats,
+        # and both latent-frame (16) and video-frame (61) entry counts.
+        viewmats, Ks, action = self._pose_to_input(pose_data, latent_num)
+
         out = self.eval_pipe(
             enable_sr=False,
             prompt=training_args.eval_prompt,
@@ -233,72 +238,46 @@ class HunyuanTrainingPipeline(TrainingPipeline):
             reference_image=self.eval_image_path,
         )
 
-        # --- Rank 0 only: extract frames, compute metrics, save ---
         if self.global_rank == 0:
-            video_tensor = out.videos  # [B, C, T, H, W], float [0, 1]
+            video_tensor = out.videos
             if isinstance(video_tensor, torch.Tensor):
                 video_np = video_tensor[0].cpu().numpy()
-                if video_np.shape[0] == 3:  # [C, T, H, W]
-                    video_np = np.transpose(video_np, (1, 2, 3, 0))  # [T, H, W, C]
+                if video_np.shape[0] == 3:
+                    video_np = np.transpose(video_np, (1, 2, 3, 0))
                 video_np = np.clip(video_np * 255, 0, 255).astype(np.uint8)
             else:
                 video_np = np.array(video_tensor)
 
-            # --- Compute metrics (only if GT frames available) ---
-            if self.gt_frames is not None:
-                gt = self.gt_frames
-                num_frames = min(len(video_np), len(gt))
-                gen = video_np[:num_frames]
-                gt_eval = gt[:num_frames]
-
-                if gen.shape[1:3] != gt_eval.shape[1:3]:
-                    import cv2
-                    h, w = gt_eval.shape[1], gt_eval.shape[2]
-                    gen = np.stack([
-                        cv2.resize(f, (w, h), interpolation=cv2.INTER_LANCZOS4)
-                        for f in gen
-                    ])
-
-                gen_f = gen.astype(np.float32) / 255.0
-                gt_f = gt_eval.astype(np.float32) / 255.0
-
-                from torchvision import transforms
-                to_tensor = transforms.ToTensor()
-                mse_scores = []
-                lpips_scores = []
-                for i in range(num_frames):
-                    mse_scores.append(float(np.mean((gen_f[i] - gt_f[i]) ** 2)))
-                    gen_t = to_tensor(gen[i]).unsqueeze(0).cuda() * 2 - 1
-                    gt_t = to_tensor(gt_eval[i]).unsqueeze(0).cuda() * 2 - 1
-                    lpips_scores.append(self.lpips_fn(gen_t, gt_t).item())
-
-                l2_mean = float(np.mean(mse_scores))
-                lpips_mean = float(np.mean(lpips_scores))
-
-                logger.info("Eval step %d: MSE=%.6f, LPIPS=%.4f (%d frames)",
-                            step, l2_mean, lpips_mean, num_frames)
-                logger.info("  per-frame MSE : %s",
-                            [f"{v:.5f}" for v in mse_scores])
-                logger.info("  per-frame LPIPS: %s",
-                            [f"{v:.4f}" for v in lpips_scores])
-                wandb.log({
-                    "eval/l2_mse": l2_mean,
-                    "eval/lpips": lpips_mean,
-                    "eval/mse_first_frame": mse_scores[0],
-                    "eval/mse_last_frame": mse_scores[-1],
-                    "eval/lpips_first_frame": lpips_scores[0],
-                    "eval/lpips_last_frame": lpips_scores[-1],
-                }, step=step)
-
-            # Save video
             import imageio
             eval_dir = os.path.join(training_args.output_dir, "eval_videos")
             os.makedirs(eval_dir, exist_ok=True)
-            video_path = os.path.join(eval_dir, f"eval_step_{step}.mp4")
+            video_path = os.path.join(eval_dir, f"eval_step_{step}_{pose_name}.mp4")
             imageio.mimsave(video_path, list(video_np), fps=24)
+            logger.info("Saved eval video: %s", video_path)
             wandb.log({
-                "eval/video": wandb.Video(video_path, caption=f"step {step}"),
+                f"eval/{pose_name}": wandb.Video(video_path,
+                                                  caption=f"step {step} {pose_name}"),
             }, step=step)
+
+    def _log_ar_validation(self, step):
+        """
+        Full AR rollout evaluation on all discovered eval poses.
+        ALL ranks participate in inference (sp-parallel).
+        """
+        if not getattr(self, 'eval_enabled', False):
+            return
+
+        pose_names = [n for n, _ in self.eval_poses]
+        logger.info("Starting AR eval at step %d on %d pose(s): %s",
+                    step, len(self.eval_poses), pose_names)
+        self.transformer.eval()
+
+        self._merge_lora_into_eval_pipe()
+
+        for pose_name, pose_data in self.eval_poses:
+            logger.info("Evaluating pose '%s' at step %d", pose_name, step)
+            self._run_eval_single_pose(pose_name, pose_data, step)
+            self.sp_group.barrier()
 
         self.transformer.train()
         self.sp_group.barrier()

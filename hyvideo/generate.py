@@ -267,24 +267,41 @@ def pose_to_input(pose_data, latent_num, tps=False):
         )
 
     pose_keys = list(pose_json.keys())
-    latent_num_from_pose = len(pose_keys)
-    assert latent_num_from_pose == latent_num, (
-        f"pose corresponds to {latent_num_from_pose * 4 - 3} frames, num_frames "
-        f"must be set to {latent_num_from_pose * 4 - 3} to ensure alignment."
-    )
+    num_pose_entries = len(pose_keys)
+
+    # Detect format from first entry
+    first_val = next(iter(pose_json.values()))
+    use_w2c_format = "w2c" in first_val  # w2c/intrinsic vs extrinsic/K
+
+    # Determine which keys to use for each latent frame
+    if num_pose_entries == latent_num:
+        # Already latent-frame indexed — use sequentially
+        selected_keys = [pose_keys[i] for i in range(latent_num)]
+    elif num_pose_entries >= (latent_num - 1) * 4 + 1:
+        # Video-frame indexed (e.g. 61 entries) — subsample with stride 4
+        selected_keys = [pose_keys[4 * i] for i in range(latent_num)]
+    else:
+        raise ValueError(
+            f"Pose has {num_pose_entries} entries, need {latent_num} (latent) "
+            f"or >= {(latent_num - 1) * 4 + 1} (video-frame) entries."
+        )
 
     intrinsic_list = []
     w2c_list = []
-    for i in range(latent_num):
-        t_key = pose_keys[i]
-        c2w = np.array(pose_json[t_key]["extrinsic"])
-        w2c = np.linalg.inv(c2w)
-        w2c_list.append(w2c)
-        intrinsic = np.array(pose_json[t_key]["K"])
+    for t_key in selected_keys:
+        val = pose_json[t_key]
+        if use_w2c_format:
+            w2c = np.array(val["w2c"])
+            intrinsic = np.array(val["intrinsic"])
+        else:
+            c2w = np.array(val["extrinsic"])
+            w2c = np.linalg.inv(c2w)
+            intrinsic = np.array(val["K"])
         intrinsic[0, 0] /= intrinsic[0, 2] * 2
         intrinsic[1, 1] /= intrinsic[1, 2] * 2
         intrinsic[0, 2] = 0.5
         intrinsic[1, 2] = 0.5
+        w2c_list.append(w2c)
         intrinsic_list.append(intrinsic)
 
     w2c_list = np.array(w2c_list)

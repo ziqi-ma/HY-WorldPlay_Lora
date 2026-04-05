@@ -503,12 +503,30 @@ class CameraJsonWMemDataset(Dataset):
 
                 pose_json = json.load(open(pose_path, 'r'))
                 pose_keys = list(pose_json.keys())
+                num_latent = latent.shape[1]
+                num_pose_entries = len(pose_keys)
+
+                # Detect format from first entry
+                first_val = next(iter(pose_json.values()))
+                use_w2c_format = "w2c" in first_val
+
+                # Select keys: latent-frame (sequential) or video-frame (stride 4)
+                if num_pose_entries == num_latent:
+                    selected_keys = [pose_keys[i] for i in range(num_latent)]
+                else:
+                    selected_keys = [pose_keys[4 * i] for i in range(num_latent)]
+
                 intrinsic_list = []
                 w2c_list = []
-                for i in range(latent.shape[1]):
-                    t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
-                    intrinsic = np.array(pose_json[t_key]['intrinsic'])
-                    w2c = np.array(pose_json[t_key]['w2c'])
+                for t_key in selected_keys:
+                    val = pose_json[t_key]
+                    if use_w2c_format:
+                        w2c = np.array(val['w2c'])
+                        intrinsic = np.array(val['intrinsic'])
+                    else:
+                        c2w = np.array(val['extrinsic'])
+                        w2c = np.linalg.inv(c2w)
+                        intrinsic = np.array(val['K'])
 
                     intrinsic[0, 0] /= intrinsic[0, 2] * 2
                     intrinsic[1, 1] /= intrinsic[1, 2] * 2

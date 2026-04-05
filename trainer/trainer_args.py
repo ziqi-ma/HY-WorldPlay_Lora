@@ -630,6 +630,7 @@ class TrainingArgs(TrainerArgs):
     eval_num_inference_steps: int = 50
     gt_frames_dir: str = ""  # directory with GT PNG frames for eval
     eval_pose_string: str = ""  # pose string for AR eval (e.g., "right-11")
+    eval_pose_dir: str = ""  # directory with subdirs each containing pose.json
     eval_prompt: str = ""  # text prompt for AR eval (default: empty)
     eval_image_path: str = ""  # reference image for AR eval (i2v input)
     tracker_project_name: str = ""
@@ -863,6 +864,10 @@ class TrainingArgs(TrainerArgs):
                             type=str,
                             default="",
                             help="Directory with GT PNG frames for eval")
+        parser.add_argument("--eval-pose-dir",
+                            type=str,
+                            default="",
+                            help="Directory with subdirs each containing pose.json for eval")
         parser.add_argument("--eval-pose-string",
                             type=str,
                             default="",

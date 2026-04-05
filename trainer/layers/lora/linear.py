@@ -80,9 +80,9 @@ class BaseLayerWithLoRA(nn.Module):
             lora_A = self.lora_A.to_local()
 
         if (self.training_mode or not self.merged) and not self.disable_lora:
-            delta = x @ (
-                self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
-                @ self.slice_lora_a_weights(lora_A.to(x, non_blocking=True)))
+            A = self.slice_lora_a_weights(lora_A.to(x, non_blocking=True))
+            B = self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
+            delta = x @ A.mT @ B.mT
             if self.lora_alpha != self.lora_rank:
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
@@ -120,6 +120,7 @@ class BaseLayerWithLoRA(nn.Module):
         if self.merged:
             self.unmerge_lora_weights()
         assert self.lora_A is not None and self.lora_B is not None, "LoRA weights not set. Please set them first."
+        scale = self.lora_alpha / self.lora_rank if self.lora_alpha != self.lora_rank else 1.0
         if isinstance(self.base_layer.weight, DTensor):
             mesh = self.base_layer.weight.data.device_mesh
             unsharded_base_layer = ReplicatedLinear(
@@ -135,8 +136,8 @@ class BaseLayerWithLoRA(nn.Module):
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(
                 get_local_torch_device()).full_tensor()
-            data += (self.slice_lora_b_weights(self.lora_B).to(data)
-                     @ self.slice_lora_a_weights(self.lora_A).to(data))
+            data += scale * (self.slice_lora_b_weights(self.lora_B).to(data)
+                             @ self.slice_lora_a_weights(self.lora_A).to(data))
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
                 unsharded_base_layer.bias = nn.Parameter(
@@ -155,7 +156,7 @@ class BaseLayerWithLoRA(nn.Module):
         else:
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
-            data += \
+            data += scale * \
                 (self.slice_lora_b_weights(self.lora_B.to(data)) @ self.slice_lora_a_weights(self.lora_A.to(data)))
             self.base_layer.weight.data = data.to(current_device,
                                                   non_blocking=True)
@@ -364,9 +365,10 @@ class NNLinearWithLoRA(BaseLayerWithLoRA):
 
         out = self.base_layer(x)
         if (self.training_mode or not self.merged) and not self.disable_lora:
-            delta = x @ (
-                self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
-                @ self.slice_lora_a_weights(lora_A.to(x, non_blocking=True)))
+            # nn.Linear computes x @ W.T, so delta = x @ A.T @ B.T
+            A = self.slice_lora_a_weights(lora_A.to(x, non_blocking=True))
+            B = self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
+            delta = x @ A.mT @ B.mT
             if self.lora_alpha != self.lora_rank:
                 delta = delta * (self.lora_alpha / self.lora_rank)
             out = out + delta
