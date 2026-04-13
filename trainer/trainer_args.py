@@ -630,8 +630,11 @@ class TrainingArgs(TrainerArgs):
     eval_num_inference_steps: int = 50
     gt_frames_dir: str = ""  # directory with GT PNG frames for eval
     eval_pose_string: str = ""  # pose string for AR eval (e.g., "right-11")
+    eval_unseen_pose_string: str = ""  # unseen pose string for AR eval
     eval_prompt: str = ""  # text prompt for AR eval (default: empty)
     eval_image_path: str = ""  # reference image for AR eval (i2v input)
+    eval_seed: int = 42  # fixed noise seed for eval/validation inference
+    fixed_training_noise: bool = False  # reuse the same noise tensor every training step
     tracker_project_name: str = ""
     wandb_run_name: str = ""
     seed: int | None = None
@@ -867,6 +870,10 @@ class TrainingArgs(TrainerArgs):
                             type=str,
                             default="",
                             help="Pose string for AR eval (e.g. 'right-11')")
+        parser.add_argument("--eval-unseen-pose-string",
+                            type=str,
+                            default="",
+                            help="Unseen pose string for AR eval")
         parser.add_argument("--eval-prompt",
                             type=str,
                             default="",
@@ -875,6 +882,13 @@ class TrainingArgs(TrainerArgs):
                             type=str,
                             default="",
                             help="Reference image for AR eval (i2v input)")
+        parser.add_argument("--eval-seed",
+                            type=int,
+                            default=42,
+                            help="Fixed noise seed for eval/validation inference")
+        parser.add_argument("--fixed-training-noise",
+                            action=StoreBoolean,
+                            help="Reuse the same noise tensor every training step")
         parser.add_argument("--tracker-project-name",
                             type=str,
                             help="Project name for tracking")

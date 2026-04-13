@@ -39,9 +39,9 @@ class HunyuanTrainingPipeline(TrainingPipeline):
             return
 
         self.eval_enabled = True
-        logger.info("AR eval enabled: every %d steps, GT from %s, pose='%s'",
+        logger.info("AR eval enabled: every %d steps, GT from %s, seen='%s', unseen='%s'",
                     training_args.eval_steps, training_args.gt_frames_dir,
-                    training_args.eval_pose_string)
+                    training_args.eval_pose_string, training_args.eval_unseen_pose_string)
 
         # Import hyvideo.generate on ALL ranks — its module-level code calls
         # initialize_parallel_state(sp=WORLD_SIZE) which is a collective op.
@@ -202,103 +202,63 @@ class HunyuanTrainingPipeline(TrainingPipeline):
         logger.info("Rank %d: merged LoRA into %d layers (scale=%.2f)",
                     self.global_rank, merged_count, scale)
 
-        # --- ALL ranks: Prepare pose/action data ---
+        # --- ALL ranks: Prepare pose/action data and run inference ---
         video_length = training_args.num_frames
         latent_num = (video_length - 1) // 4 + 1
-        viewmats, Ks, action = self._pose_to_input(
-            training_args.eval_pose_string, latent_num
-        )
 
-        # --- ALL ranks: Run full inference (sp=8) ---
-        out = self.eval_pipe(
-            enable_sr=False,
-            prompt=training_args.eval_prompt,
-            aspect_ratio="9:16",
-            num_inference_steps=training_args.eval_num_inference_steps,
-            sr_num_inference_steps=None,
-            video_length=video_length,
-            negative_prompt="",
-            seed=1,
-            output_type="pt",
-            prompt_rewrite=False,
-            return_pre_sr_video=False,
-            viewmats=viewmats.unsqueeze(0),
-            Ks=Ks.unsqueeze(0),
-            action=action.unsqueeze(0),
-            few_step=False,
-            chunk_latent_frames=4,
-            model_type="ar",
-            user_height=training_args.num_height,
-            user_width=training_args.num_width,
-            reference_image=self.eval_image_path,
-        )
-
-        # --- Rank 0 only: extract frames, compute metrics, save ---
-        if self.global_rank == 0:
-            video_tensor = out.videos  # [B, C, T, H, W], float [0, 1]
-            if isinstance(video_tensor, torch.Tensor):
-                video_np = video_tensor[0].cpu().numpy()
-                if video_np.shape[0] == 3:  # [C, T, H, W]
-                    video_np = np.transpose(video_np, (1, 2, 3, 0))  # [T, H, W, C]
-                video_np = np.clip(video_np * 255, 0, 255).astype(np.uint8)
+        # Load fixed noise for inference if training used fixed noise
+        eval_latents = None
+        if training_args.fixed_training_noise:
+            noise_path = os.path.join(training_args.output_dir, "fixed_noise.pt")
+            if os.path.exists(noise_path):
+                eval_latents = torch.load(noise_path, map_location=self.device)
             else:
-                video_np = np.array(video_tensor)
+                logger.warning("fixed_training_noise=True but fixed_noise.pt not found at %s", noise_path)
 
-            # --- Compute metrics (only if GT frames available) ---
-            if self.gt_frames is not None:
-                gt = self.gt_frames
-                num_frames = min(len(video_np), len(gt))
-                gen = video_np[:num_frames]
-                gt_eval = gt[:num_frames]
+        def _run_eval(pose_string, tag):
+            viewmats, Ks, action = self._pose_to_input(pose_string, latent_num)
+            out = self.eval_pipe(
+                enable_sr=False,
+                prompt=training_args.eval_prompt,
+                aspect_ratio="9:16",
+                num_inference_steps=training_args.eval_num_inference_steps,
+                sr_num_inference_steps=None,
+                video_length=video_length,
+                negative_prompt="",
+                seed=training_args.eval_seed,
+                output_type="pt",
+                prompt_rewrite=False,
+                return_pre_sr_video=False,
+                viewmats=viewmats.unsqueeze(0),
+                Ks=Ks.unsqueeze(0),
+                action=action.unsqueeze(0),
+                few_step=False,
+                chunk_latent_frames=4,
+                model_type="ar",
+                user_height=training_args.num_height,
+                user_width=training_args.num_width,
+                reference_image=self.eval_image_path,
+                latents=eval_latents,
+            )
+            if self.global_rank == 0:
+                video_tensor = out.videos
+                if isinstance(video_tensor, torch.Tensor):
+                    video_np = video_tensor[0].cpu().numpy()
+                    if video_np.shape[0] == 3:
+                        video_np = np.transpose(video_np, (1, 2, 3, 0))
+                    video_np = np.clip(video_np * 255, 0, 255).astype(np.uint8)
+                else:
+                    video_np = np.array(video_tensor)
+                import imageio
+                eval_dir = os.path.join(training_args.output_dir, "eval_videos")
+                os.makedirs(eval_dir, exist_ok=True)
+                video_path = os.path.join(eval_dir, f"eval_step_{step}_{tag}.mp4")
+                imageio.mimsave(video_path, list(video_np), fps=24)
+                logger.info("Eval step %d [%s]: saved %s", step, tag, video_path)
 
-                if gen.shape[1:3] != gt_eval.shape[1:3]:
-                    import cv2
-                    h, w = gt_eval.shape[1], gt_eval.shape[2]
-                    gen = np.stack([
-                        cv2.resize(f, (w, h), interpolation=cv2.INTER_LANCZOS4)
-                        for f in gen
-                    ])
-
-                gen_f = gen.astype(np.float32) / 255.0
-                gt_f = gt_eval.astype(np.float32) / 255.0
-
-                from torchvision import transforms
-                to_tensor = transforms.ToTensor()
-                mse_scores = []
-                lpips_scores = []
-                for i in range(num_frames):
-                    mse_scores.append(float(np.mean((gen_f[i] - gt_f[i]) ** 2)))
-                    gen_t = to_tensor(gen[i]).unsqueeze(0).cuda() * 2 - 1
-                    gt_t = to_tensor(gt_eval[i]).unsqueeze(0).cuda() * 2 - 1
-                    lpips_scores.append(self.lpips_fn(gen_t, gt_t).item())
-
-                l2_mean = float(np.mean(mse_scores))
-                lpips_mean = float(np.mean(lpips_scores))
-
-                logger.info("Eval step %d: MSE=%.6f, LPIPS=%.4f (%d frames)",
-                            step, l2_mean, lpips_mean, num_frames)
-                logger.info("  per-frame MSE : %s",
-                            [f"{v:.5f}" for v in mse_scores])
-                logger.info("  per-frame LPIPS: %s",
-                            [f"{v:.4f}" for v in lpips_scores])
-                wandb.log({
-                    "eval/l2_mse": l2_mean,
-                    "eval/lpips": lpips_mean,
-                    "eval/mse_first_frame": mse_scores[0],
-                    "eval/mse_last_frame": mse_scores[-1],
-                    "eval/lpips_first_frame": lpips_scores[0],
-                    "eval/lpips_last_frame": lpips_scores[-1],
-                }, step=step)
-
-            # Save video
-            import imageio
-            eval_dir = os.path.join(training_args.output_dir, "eval_videos")
-            os.makedirs(eval_dir, exist_ok=True)
-            video_path = os.path.join(eval_dir, f"eval_step_{step}.mp4")
-            imageio.mimsave(video_path, list(video_np), fps=24)
-            wandb.log({
-                "eval/video": wandb.Video(video_path, caption=f"step {step}"),
-            }, step=step)
+        _run_eval(training_args.eval_pose_string, "seen")
+        if training_args.eval_unseen_pose_string:
+            _run_eval(training_args.eval_unseen_pose_string, "unseen")
 
         self.transformer.train()
         self.sp_group.barrier()

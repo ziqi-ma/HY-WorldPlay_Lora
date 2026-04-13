@@ -501,7 +501,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 shape, generator=generator, device=device, dtype=dtype
             )
         else:
-            latents = latents.to(device)
+            latents = latents.clone().to(device=device, dtype=dtype)
 
         # Check existence to make it compatible with FlowMatchEulerDiscreteScheduler
         if hasattr(self.scheduler, "init_noise_sigma"):
@@ -1476,6 +1476,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         model_type: str = "ar",
         user_height: Optional[int] = None,
         user_width: Optional[int] = None,
+        latents: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         r"""
@@ -1780,6 +1781,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             self.target_dtype,
             device,
             generator,
+            latents=latents,
         )
 
         with auto_offload_model(

@@ -505,8 +505,12 @@ class CameraJsonWMemDataset(Dataset):
                 pose_keys = list(pose_json.keys())
                 intrinsic_list = []
                 w2c_list = []
+                latent_indexed_pose = len(pose_keys) == latent.shape[1]
                 for i in range(latent.shape[1]):
-                    t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
+                    if latent_indexed_pose:
+                        t_key = pose_keys[i]
+                    else:
+                        t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
                     intrinsic = np.array(pose_json[t_key]['intrinsic'])
                     w2c = np.array(pose_json[t_key]['w2c'])
 

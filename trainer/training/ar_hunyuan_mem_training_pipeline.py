@@ -289,10 +289,23 @@ class TrainingPipeline(LoRAPipeline, ABC):
         latent_t = latents.shape[2]
         latent_h = latents.shape[3]
         latent_w = latents.shape[4]
-        noise = torch.randn(latents.shape,
-                            generator=self.noise_gen_cuda,
-                            device=latents.device,
-                            dtype=latents.dtype)
+        if self.training_args.fixed_training_noise:
+            if self.fixed_noise is None or self.fixed_noise.shape != latents.shape:
+                self.fixed_noise = torch.randn(latents.shape,
+                                               generator=self.noise_gen_cuda,
+                                               device=latents.device,
+                                               dtype=latents.dtype)
+                noise_path = os.path.join(self.training_args.output_dir, "fixed_noise.pt")
+                if self.global_rank == 0:
+                    os.makedirs(self.training_args.output_dir, exist_ok=True)
+                    torch.save(self.fixed_noise.cpu(), noise_path)
+                    logger.info("Saved fixed training noise to %s", noise_path)
+            noise = self.fixed_noise
+        else:
+            noise = torch.randn(latents.shape,
+                                generator=self.noise_gen_cuda,
+                                device=latents.device,
+                                dtype=latents.dtype)
 
         # add a parameter: chunk_latent_num means number of latent in one chunk
         chunk_latent_num = 4
@@ -322,7 +335,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
             for i in range(0, indices.shape[0] - 4, 4):
                 rand_val = torch.randint(500, 985, (1, ), device=latents.device)
                 indices[i:i + 4] = rand_val
-        
+        indices = indices.clamp(0, self.noise_scheduler.config.num_train_timesteps - 1)
+
         timesteps = self.noise_scheduler.timesteps[indices].to(device=self.device)
         if self.training_args.sp_size > 1:
             # Make sure that the timesteps are the same across all sp processes.
@@ -579,6 +593,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
             self.seed)
         self.validation_random_generator = torch.Generator(
             device="cpu").manual_seed(self.seed)
+        self.fixed_noise: torch.Tensor | None = None
         logger.info("Initialized random seeds with seed: %s", self.seed)
 
         self.noise_scheduler = FlowMatchEulerDiscreteScheduler()
