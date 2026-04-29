@@ -219,6 +219,13 @@ class MMDoubleStreamBlock(nn.Module):
         )
 
     # modulating module for img embedding
+    @staticmethod
+    def _base_linear(layer, x):
+        """Call layer using base weights only, bypassing any LoRA delta."""
+        if hasattr(layer, 'base_layer'):
+            return layer.base_layer(x)
+        return layer(x)
+
     def modulate_img(self, vec, img):
         (
             img_mod1_shift,
@@ -242,10 +249,24 @@ class MMDoubleStreamBlock(nn.Module):
         img_v = rearrange(img_v, "B L (H D) -> B L H D", H=self.heads_num)
         img_q = self.img_attn_q_norm(img_q).to(img_v)
         img_k = self.img_attn_k_norm(img_k).to(img_v)
+
+        # When prope_base_qk is set, compute separate base Q/K (no LoRA) for PRoPE path
+        if getattr(self, 'prope_base_qk', False):
+            img_q_p = self._base_linear(self.img_attn_q, img_modulated)
+            img_k_p = self._base_linear(self.img_attn_k, img_modulated)
+            img_q_p = rearrange(img_q_p, "B L (H D) -> B L H D", H=self.heads_num)
+            img_k_p = rearrange(img_k_p, "B L (H D) -> B L H D", H=self.heads_num)
+            img_q_p = self.img_attn_q_norm(img_q_p).to(img_v)
+            img_k_p = self.img_attn_k_norm(img_k_p).to(img_v)
+        else:
+            img_q_p, img_k_p = img_q, img_k
+
         return (
             img_q,
             img_k,
             img_v,
+            img_q_p,
+            img_k_p,
             img_mod1_gate,
             img_mod2_shift,
             img_mod2_scale,
@@ -317,6 +338,8 @@ class MMDoubleStreamBlock(nn.Module):
             img_q,
             img_k,
             img_v,
+            img_q_p,
+            img_k_p,
             img_mod1_gate,
             img_mod2_shift,
             img_mod2_scale,
@@ -327,8 +350,8 @@ class MMDoubleStreamBlock(nn.Module):
         # delete rope components (original attn included)
         # Apply ProPE transformation to Q, K, V using camera view matrices and intrinsics
         img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
-            img_q.permute(0, 2, 1, 3),
-            img_k.permute(0, 2, 1, 3),
+            img_q_p.permute(0, 2, 1, 3),
+            img_k_p.permute(0, 2, 1, 3),
             img_v.permute(0, 2, 1, 3),
             viewmats=viewmats,
             Ks=Ks,
@@ -401,6 +424,8 @@ class MMDoubleStreamBlock(nn.Module):
             img_q,
             img_k,
             img_v,
+            img_q_p,
+            img_k_p,
             img_mod1_gate,
             img_mod2_shift,
             img_mod2_scale,
@@ -418,8 +443,8 @@ class MMDoubleStreamBlock(nn.Module):
 
         # add camera pose through prope
         img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
-            img_q.permute(0, 2, 1, 3),
-            img_k.permute(0, 2, 1, 3),
+            img_q_p.permute(0, 2, 1, 3),
+            img_k_p.permute(0, 2, 1, 3),
             img_v.permute(0, 2, 1, 3),
             viewmats=viewmats,
             Ks=Ks,
@@ -1156,6 +1181,11 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             # Zero-initialize the bias term for the projection layer.
             if block.img_attn_prope_proj.bias is not None:
                 nn.init.zeros_(block.img_attn_prope_proj.bias)
+
+    def set_prope_base_qk(self, enabled: bool = True):
+        """When enabled, PRoPE uses base Q/K (no LoRA delta) for camera-aware attention scores."""
+        for block in self.double_blocks:
+            block.prope_base_qk = enabled
 
     def get_text_and_mask(
         self,

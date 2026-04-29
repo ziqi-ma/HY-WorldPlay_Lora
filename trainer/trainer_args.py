@@ -692,6 +692,7 @@ class TrainingArgs(TrainerArgs):
     lora_rank: int | None = None
     lora_alpha: int | None = None
     lora_training: bool = False
+    prope_base_qk: bool = False  # use base Q/K (no LoRA) for PRoPE camera attention scores
 
     # camera dataset
     json_path: str = ""

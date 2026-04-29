@@ -101,12 +101,51 @@ def pose_json_to_inputs(pose_json_path):
     )
 
 
-def merge_lora(pipe, lora_ckpt_path, lora_rank, lora_alpha, lora_target_modules, rank):
-    """Load LoRA safetensors and merge into pipe.transformer weights."""
+class _LinearWithBase(torch.nn.Module):
+    """Thin wrapper that keeps the original base weight accessible via .base_layer."""
+    def __init__(self, linear: torch.nn.Linear, base_weight: torch.Tensor):
+        super().__init__()
+        self.linear = linear
+        # Frozen copy of the pre-merge weight for prope_base_qk
+        self.base_weight = base_weight
+
+    class _BaseProxy:
+        """Mimics nn.Linear just enough for _base_linear() to call it."""
+        def __init__(self, weight, bias):
+            self.weight = weight
+            self.bias = bias
+        def __call__(self, x):
+            return torch.nn.functional.linear(x, self.weight, self.bias)
+
+    @property
+    def base_layer(self):
+        return self._BaseProxy(self.base_weight, self.linear.bias)
+
+    def forward(self, x):
+        return self.linear(x)
+
+    # Forward attribute lookups to the wrapped linear so the transformer code
+    # (weight, bias, etc.) still works unchanged.
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.linear, name)
+
+
+def merge_lora(pipe, lora_ckpt_path, lora_rank, lora_alpha, lora_target_modules, rank,
+               prope_base_qk: bool = False):
+    """Load LoRA safetensors and merge into pipe.transformer weights.
+
+    When prope_base_qk=True, img_attn_q/k layers are wrapped to retain base
+    weights so PRoPE can use them without the LoRA delta.
+    """
     scale = lora_alpha / lora_rank
     state_dict = load_file(lora_ckpt_path)
 
     merged = 0
+    prope_qk_names = {"img_attn_q", "img_attn_k"}
+
     for name, module in pipe.transformer.named_modules():
         if not isinstance(module, torch.nn.Linear):
             continue
@@ -126,24 +165,39 @@ def merge_lora(pipe, lora_ckpt_path, lora_rank, lora_alpha, lora_target_modules,
         if lora_A is None or lora_B is None:
             continue
 
+        # Save base weight before merging if this layer feeds PRoPE Q/K
+        is_prope_qk = prope_base_qk and any(t in name for t in prope_qk_names)
+        if is_prope_qk:
+            base_weight = module.weight.data.clone()
+
         module.weight.data += scale * (
             lora_B.to(module.weight.device, dtype=module.weight.dtype)
             @ lora_A.to(module.weight.device, dtype=module.weight.dtype)
         ).T
         merged += 1
 
+        # Wrap the layer so _base_linear() can retrieve the pre-merge weight
+        if is_prope_qk:
+            wrapper = _LinearWithBase(module, base_weight)
+            parent = pipe.transformer.get_submodule(".".join(name.split(".")[:-1]))
+            setattr(parent, name.split(".")[-1], wrapper)
+
+    if prope_base_qk:
+        pipe.transformer.set_prope_base_qk(True)
+
     if rank == 0:
-        print(f"[LoRA] merged {merged} layers (scale={scale:.2f})")
+        print(f"[LoRA] merged {merged} layers (scale={scale:.2f})"
+              + (" [prope_base_qk=True]" if prope_base_qk else ""))
     return merged
 
 
 def run_one(pipe, pose_json, image_path, output_dir, num_frames, num_height, num_width,
-            num_inference_steps, seed, rank, latents=None):
+            num_inference_steps, seed, rank, latents=None, prompt=""):
     viewmats, Ks, action = pose_json_to_inputs(pose_json)
 
     out = pipe(
         enable_sr=False,
-        prompt="",
+        prompt=prompt,
         aspect_ratio="9:16",
         num_inference_steps=num_inference_steps,
         sr_num_inference_steps=None,
@@ -195,9 +249,9 @@ def main():
                                  "img_attn_prope_proj", "txt_attn_q", "txt_attn_k",
                                  "txt_attn_v", "txt_attn_proj",
                                  "linear1_q", "linear1_k", "linear1_v"])
-    parser.add_argument("--pose_json", required=True)
+    parser.add_argument("--pose_json", nargs="+", required=True)
+    parser.add_argument("--output_dir", nargs="+", required=True)
     parser.add_argument("--image_path", required=True)
-    parser.add_argument("--output_dir", required=True)
     parser.add_argument("--num_frames", type=int, default=61)
     parser.add_argument("--num_height", type=int, default=480)
     parser.add_argument("--num_width", type=int, default=832)
@@ -205,7 +259,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--noise_path", type=str, default=None,
                         help="Path to fixed_noise.pt saved during training")
+    parser.add_argument("--prompt", type=str, default="")
+    parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--prope_base_qk", action="store_true",
+                        help="Use base Q/K (no LoRA delta) for PRoPE camera attention scores")
     args = parser.parse_args()
+
+    if len(args.pose_json) != len(args.output_dir):
+        raise ValueError("--pose_json and --output_dir must have the same number of entries")
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -241,7 +302,7 @@ def main():
     if rank == 0:
         print(f"Merging LoRA from {args.lora_ckpt}")
     merge_lora(pipe, args.lora_ckpt, args.lora_rank, args.lora_alpha,
-               args.lora_target_modules, rank)
+               args.lora_target_modules, rank, prope_base_qk=args.prope_base_qk)
     dist.barrier()
 
     latents = None
@@ -250,11 +311,17 @@ def main():
         if rank == 0:
             print(f"Loaded fixed noise from {args.noise_path}")
 
-    if rank == 0:
-        print(f"Running inference on {args.pose_json}")
-    run_one(pipe, args.pose_json, args.image_path, args.output_dir,
-            args.num_frames, args.num_height, args.num_width,
-            args.num_inference_steps, args.seed, rank, latents=latents)
+    for pose_json, output_dir in zip(args.pose_json, args.output_dir):
+        if args.skip_existing and os.path.exists(os.path.join(output_dir, "video.mp4")):
+            if rank == 0:
+                print(f"Skipping {output_dir} (already exists)")
+            continue
+        if rank == 0:
+            print(f"Running inference on {pose_json}")
+        run_one(pipe, pose_json, args.image_path, output_dir,
+                args.num_frames, args.num_height, args.num_width,
+                args.num_inference_steps, args.seed, rank, latents=latents,
+                prompt=args.prompt)
 
     dist.destroy_process_group()
 

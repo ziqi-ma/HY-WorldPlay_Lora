@@ -130,6 +130,9 @@ class LoRAPipeline(ComposedPipelineBase):
                 replace_submodule(self.modules["transformer"], name, layer)
                 converted_count += 1
         logger.info("Converted %d layers to LoRA layers", converted_count)
+        if getattr(self.trainer_args, 'prope_base_qk', False):
+            self.modules["transformer"].set_prope_base_qk(True)
+            logger.info("PRoPE base QK enabled: camera scores use base weights, bypassing LoRA delta")
 
     def set_lora_adapter(self,
                          lora_nickname: str,
